@@ -60,8 +60,8 @@ def process_excel(uploaded_file):
             result_rows.append({
                 "Дата ДДС": date_dds,
                 "Дата P&L": date_pl,
-                "Приход": round(income, 2),
-                "Расход": round(expense, 2),
+                "Приход": income,
+                "Расход": expense,
                 "Статья операции": article,
                 "Касса / Счет": str(col).strip(),
                 "Комментарий": description
@@ -76,12 +76,12 @@ def process_excel(uploaded_file):
     result_df['Дата P&L'] = pd.to_datetime(result_df['Дата P&L'], errors='coerce')
     result_df = result_df.sort_values(by='Дата ДДС').reset_index(drop=True)
 
-    # Для отображения
+    # --- Для отображения в Streamlit: заменяем 0 на пусто ---
     display_df = result_df.copy()
     display_df['Дата ДДС'] = display_df['Дата ДДС'].dt.strftime('%d.%m.%Y').fillna('')
     display_df['Дата P&L'] = display_df['Дата P&L'].dt.strftime('%d.%m.%Y').fillna('')
-    display_df['Приход'] = display_df['Приход'].replace(0, '')
-    display_df['Расход'] = display_df['Расход'].replace(0, '')
+    display_df['Приход'] = display_df['Приход'].apply(lambda x: '' if x == 0 else x)
+    display_df['Расход'] = display_df['Расход'].apply(lambda x: '' if x == 0 else x)
 
     return display_df, result_df
 
@@ -93,28 +93,57 @@ uploaded_file = st.file_uploader("📂 Загрузите Excel-файл", type=
 
 if uploaded_file:
     try:
-        display_df, export_df = process_excel(uploaded_file)
-        if display_df is not None:
-            st.dataframe(display_df, use_container_width=True)
+        output = process_excel(uploaded_file)
+        if output is None:
+            st.stop()
+        display_df, export_df = output
 
-            # Кнопка скачивания
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                export_df.to_excel(writer, index=False, sheet_name='Операции')
-                worksheet = writer.sheets['Операции']
-                for idx, col in enumerate(worksheet.columns, 1):
-                    max_len = max(len(str(cell.value)) if cell.value else 0 for cell in col)
-                    if worksheet.cell(1, idx).value == "Комментарий":
-                        worksheet.column_dimensions[chr(64 + idx)].width = 50
-                    else:
-                        worksheet.column_dimensions[chr(64 + idx)].width = min(max_len + 2, 50)
+        st.dataframe(display_df, use_container_width=True)
 
-            output.seek(0)
-            st.download_button(
-                label="💾 Скачать результат (Excel)",
-                data=output,
-                file_name="Операции_финолог_результат.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        # --- Подготовка к экспорту в Excel с нужным форматом дат и пустыми ячейками ---
+        export_for_excel = export_df.copy()
+
+        # Преобразуем даты в СТРОКИ формата "01.10.2025" (важно — не даты Excel!)
+        export_for_excel['Дата ДДС'] = pd.to_datetime(export_for_excel['Дата ДДС'], errors='coerce').dt.strftime('%d.%m.%Y').fillna('')
+        export_for_excel['Дата P&L'] = pd.to_datetime(export_for_excel['Дата P&L'], errors='coerce').dt.strftime('%d.%m.%Y').fillna('')
+
+        # Заменяем 0 на пустую строку в Приход/Расход
+        export_for_excel['Приход'] = export_for_excel['Приход'].apply(lambda x: '' if x == 0 else x)
+        export_for_excel['Расход'] = export_for_excel['Расход'].apply(lambda x: '' if x == 0 else x)
+
+        # --- Формируем имя файла ---
+        dds_dates = pd.to_datetime(export_for_excel['Дата ДДС'], format='%d.%m.%Y', errors='coerce').dropna()
+        if dds_dates.empty:
+            file_name = "Операции_без_дат.xlsx"
+        else:
+            first_date = dds_dates.min().strftime('%d.%m.%Y')
+            last_date = dds_dates.max().strftime('%d.%m.%Y')
+            file_name = f"Операции_{first_date}_{last_date}.xlsx"
+
+        # --- Сохраняем в Excel ---
+        output_buffer = BytesIO()
+        with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
+            export_for_excel.to_excel(writer, index=False, sheet_name='Операции')
+            worksheet = writer.sheets['Операции']
+
+            # Настройка ширины столбцов
+            for idx, col in enumerate(worksheet.columns, 1):
+                max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
+                col_letter = worksheet.cell(row=1, column=idx).column_letter
+                if worksheet.cell(row=1, column=idx).value == "Комментарий":
+                    worksheet.column_dimensions[col_letter].width = 50
+                else:
+                    worksheet.column_dimensions[col_letter].width = min(max_len + 2, 50)
+
+        output_buffer.seek(0)
+
+        st.download_button(
+            label="💾 Скачать результат (Excel)",
+            data=output_buffer,
+            file_name=file_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
     except Exception as e:
         st.error(f"Ошибка при обработке файла: {e}")
+        st.exception(e)  # для отладки (можно убрать в продакшене)
