@@ -52,8 +52,8 @@ def process_excel(uploaded_file):
             except:
                 continue
 
-            income = value if value > 0 else 0
-            expense = -value if value < 0 else 0
+            income = round(value, 2) if value > 0 else 0
+            expense = round(-value, 2) if value < 0 else 0
             if income == 0 and expense == 0:
                 continue
 
@@ -112,7 +112,7 @@ if uploaded_file:
         export_for_excel['Расход'] = export_for_excel['Расход'].apply(lambda x: '' if x == 0 else x)
 
         # --- Формируем имя файла ---
-        dds_dates = pd.to_datetime(export_for_excel['Дата ДДС'], format='%d.%m.%Y', errors='coerce').dropna()
+        dds_dates = export_df['Дата ДДС'].dropna()
         if dds_dates.empty:
             file_name = "Операции_без_дат.xlsx"
         else:
