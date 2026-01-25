@@ -35,7 +35,7 @@ def process_excel(uploaded_file):
     amount_cols = [col for col in df.columns if str(col).strip() not in exclude_cols]
 
     result_rows = []
-    for _, row in df.iterrows():
+    for src_idx, row in df.iterrows():
         date_dds = get_scalar(row.get('Дата операции', pd.NaT))
         date_pl = get_scalar(row.get('Дата начисления', pd.NaT))
         description = str(get_scalar(row.get('Описание', ''))) if pd.notna(row.get('Описание', None)) else ''
@@ -58,6 +58,9 @@ def process_excel(uploaded_file):
                 continue
 
             result_rows.append({
+                "Источник_строка": int(src_idx) + 1,
+                "Источник_колонка": str(col).strip(),
+
                 "Дата ДДС": date_dds,
                 "Дата P&L": date_pl,
                 "Приход": income,
