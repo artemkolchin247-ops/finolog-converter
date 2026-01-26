@@ -30,54 +30,80 @@ def get_scalar(value):
 
 def parse_amount(val):
     """
-    Parse amount from various Excel-like formats.
-    Returns: (float_value, error_message)
+    Returns:
+      value: float|None
+      reason: str|None  (machine-readable reason)
+      debug: dict       (detailed log)
     """
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return None, "EMPTY"
+    debug = {
+        "raw": val,
+        "raw_str": None,
+        "normalized": None,
+        "rule": None,
+        "exception": None,
+    }
 
-    # If already numeric
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        debug["rule"] = "EMPTY:None/NaN"
+        return None, "EMPTY", debug
+
     if isinstance(val, (int, float)) and not pd.isna(val):
-        return float(val), None
+        debug["rule"] = "OK:already_numeric"
+        debug["raw_str"] = str(val)
+        debug["normalized"] = str(float(val))
+        return float(val), None, debug
 
     raw = norm_text(val)
+    debug["raw_str"] = raw
+
     if raw == "" or raw.lower() in {"-", "none", "nan"}:
-        return None, "EMPTY"
+        debug["rule"] = "EMPTY:blank_or_marker"
+        return None, "EMPTY", debug
 
-    # Normalize unicode minus variants
-    raw = raw.replace("−", "-").replace("–", "-").replace("—", "-")
+    # normalize unicode minus variants
+    s = raw.replace("−", "-").replace("–", "-").replace("—", "-")
 
-    # Parentheses for negatives: (500) -> -500
-    is_paren_negative = raw.startswith("(") and raw.endswith(")")
+    # parentheses negatives
+    is_paren_negative = s.startswith("(") and s.endswith(")")
     if is_paren_negative:
-        raw = raw[1:-1].strip()
+        debug["rule"] = "RULE:paren_negative"
+        s = s[1:-1].strip()
 
-    # Remove currency symbols and spaces (including NBSP/narrow NBSP already normalized)
-    raw = re.sub(r"[₽$€]", "", raw)
-    raw = raw.replace(" ", "")
+    # remove currency symbols
+    s = re.sub(r"[₽$€]", "", s)
 
-    # Some exports use trailing minus: 1000- -> -1000
-    if raw.endswith("-") and raw[:-1].replace(".", "").replace(",", "").isdigit():
-        raw = "-" + raw[:-1]
+    # remove spaces (incl. NBSP already normalized in norm_text)
+    s = s.replace(" ", "")
 
-    # Decide decimal separator if both present
-    if "," in raw and "." in raw:
-        # decimal is the last separator
-        if raw.rfind(",") > raw.rfind("."):
-            raw = raw.replace(".", "").replace(",", ".")
+    # trailing minus: 1000- -> -1000
+    if s.endswith("-") and s[:-1].replace(".", "").replace(",", "").isdigit():
+        debug["rule"] = "RULE:trailing_minus"
+        s = "-" + s[:-1]
+
+    # handle separators
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            debug["rule"] = (debug["rule"] or "") + "|RULE:EU_mixed_sep"
+            s = s.replace(".", "").replace(",", ".")
         else:
-            raw = raw.replace(",", "")
+            debug["rule"] = (debug["rule"] or "") + "|RULE:US_mixed_sep"
+            s = s.replace(",", "")
     else:
-        raw = raw.replace(",", ".")
+        debug["rule"] = (debug["rule"] or "") + "|RULE:single_sep"
+        s = s.replace(",", ".")
 
-    # Final sanity: allow leading sign and one dot
+    debug["normalized"] = s
+
     try:
-        num = float(raw)
+        num = float(s)
         if is_paren_negative:
             num = -abs(num)
-        return num, None
-    except Exception:
-        return None, f"PARSE_FAIL: {val}"
+        debug["rule"] = "OK:parsed" if debug["rule"] is None else ("OK:parsed|" + debug["rule"])
+        return num, None, debug
+    except Exception as e:
+        debug["rule"] = "FAIL:float_cast"
+        debug["exception"] = repr(e)
+        return None, "PARSE_FAIL", debug
 
 def detect_header_row(df_raw: pd.DataFrame) -> int | None:
     """
@@ -177,18 +203,47 @@ def process_excel(uploaded_file):
 
             raw_val = get_scalar(row.get(col))
 
-            value, err = parse_amount(raw_val)
+            value, reason, dbg = parse_amount(raw_val)
 
-            if err == "EMPTY":
+            if reason == "EMPTY":
                 continue
 
-            # If parse failed: keep record in error table; do NOT silently drop
-            if err is not None:
+            # если парсинг не удался — пишем точную причину и лог
+            if reason is not None:
                 error_rows.append({
                     "Источник_строка": int(src_idx) + 1,
                     "Источник_колонка": norm_text(col),
-                    "Исходное значение": raw_val,
-                    "Ошибка": err,
+            
+                    "Сумма_как_в_файле": dbg.get("raw_str"),
+                    "Сумма_нормализованная": dbg.get("normalized"),
+                    "Сумма_числом": "",
+            
+                    "Причина_пропуска": reason,
+                    "Лог": f"{dbg.get('rule')} | exception={dbg.get('exception')}",
+            
+                    "Дата ДДС (как в файле)": date_dds,
+                    "Дата P&L (как в файле)": date_pl,
+                    "Статья": article,
+                    "Комментарий": description,
+                })
+                continue
+            
+            income = round(value, 2) if value > 0 else 0.0
+            expense = round(-value, 2) if value < 0 else 0.0
+            
+            # если число есть, но после округления стало 0 — фиксируем как отдельную причину
+            if income == 0.0 and expense == 0.0 and abs(value) > 0:
+                error_rows.append({
+                    "Источник_строка": int(src_idx) + 1,
+                    "Источник_колонка": norm_text(col),
+            
+                    "Сумма_как_в_файле": dbg.get("raw_str"),
+                    "Сумма_нормализованная": dbg.get("normalized"),
+                    "Сумма_числом": value,
+            
+                    "Причина_пропуска": "ROUNDED_TO_ZERO",
+                    "Лог": f"value={value} -> income={income}, expense={expense} (round to 2 decimals)",
+            
                     "Дата ДДС (как в файле)": date_dds,
                     "Дата P&L (как в файле)": date_pl,
                     "Статья": article,
@@ -236,7 +291,7 @@ def process_excel(uploaded_file):
         columns=["Источник_строка","Источник_колонка","Дата ДДС","Дата P&L","Приход","Расход","Статья операции","Касса / Счет","Комментарий"]
     )
     error_df = pd.DataFrame(error_rows) if error_rows else pd.DataFrame(
-        columns=["Источник_строка","Источник_колонка","Исходное значение","Ошибка","Дата ДДС (как в файле)","Дата P&L (как в файле)","Статья","Комментарий"]
+        columns=["Источник_строка","Источник_колонка","Сумма_как_в_файле","Сумма_нормализованная","Сумма_числом","Причина_пропуска","Лог","Дата ДДС (как в файле)","Дата P&L (как в файле)","Статья","Комментарий"]
     )
 
     # Normalize dates for sorting/export
