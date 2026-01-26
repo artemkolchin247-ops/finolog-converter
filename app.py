@@ -154,13 +154,8 @@ def detect_header_row(df_raw: pd.DataFrame) -> int | None:
             return i
     return None
 
-def build_amount_columns(df: pd.DataFrame, headers):
-    """
-    Определяет денежные колонки автоматически.
-    Корректно работает даже при дублирующихся названиях столбцов.
-    """
-
-    exclude = {
+def build_amount_columns(df: pd.DataFrame, headers=None):
+    exclude_cols = {
         "дата операции",
         "описание",
         "статья",
@@ -168,45 +163,8 @@ def build_amount_columns(df: pd.DataFrame, headers):
         "",
         "nan",
     }
-
-    sample = df.head(200)
-
-    amount_cols = []
-
-    for h in headers:
-        if norm_key(h) in exclude:
-            continue
-
-        col_data = sample.loc[:, h]
-
-        # если несколько колонок с одинаковым именем — берём их все
-        if isinstance(col_data, pd.DataFrame):
-            values = []
-            for _, s in col_data.items():
-                values.extend(s.tolist())
-        else:
-            values = col_data.tolist()
-
-        ok = 0
-        nonempty = 0
-
-        for v in values:
-            s = norm_text(v)
-            if s == "" or s.lower() in {"-", "none", "nan"}:
-                continue
-
-            nonempty += 1
-            val, reason, _ = parse_amount(v)
-            if reason is None and val is not None:
-                ok += 1
-
-        # колонка считается денежной, если:
-        # - есть хотя бы 3 числа
-        # - и минимум 30% непустых значений — числовые
-        if ok >= 3 and (nonempty == 0 or ok / max(nonempty, 1) >= 0.30):
-            amount_cols.append(h)
-
-    return amount_cols
+    return [c for c in df.columns if norm_key(c) not in exclude_cols]
+amount_cols = build_amount_columns(df)
 
 # =========================
 # Core processing
@@ -278,7 +236,7 @@ def process_excel(uploaded_file):
 
             value, reason, dbg = parse_amount(raw_val)
 
-            if reason == "EMPTY":
+            if reason in {"EMPTY", "NON_AMOUNT"}:
                 continue
 
             # если парсинг не удался — пишем точную причину и лог
