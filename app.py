@@ -30,28 +30,25 @@ def get_scalar(value):
 
 def parse_amount(val):
     """
-    Универсальный парсер сумм из Excel.
-
     Возвращает:
       value: float | None
-      reason: str | None        # None = успешно, иначе причина пропуска/ошибки
-      debug: dict               # подробный лог преобразований
+      reason: str | None   # None = успешно; EMPTY/NON_AMOUNT/PARSE_FAIL = не сумма
+      debug: dict
     """
-
     debug = {
-        "raw": val,                 # исходное значение (как пришло из pandas)
-        "raw_str": None,            # строковое представление после norm_text
-        "normalized": None,         # строка после чистки/нормализации
-        "rule": None,               # какие правила сработали
-        "exception": None,          # исключение, если было
+        "raw": val,
+        "raw_str": None,
+        "normalized": None,
+        "rule": None,
+        "exception": None,
     }
 
-    # 1) пусто / NaN
+    # None/NaN
     if val is None or (isinstance(val, float) and pd.isna(val)):
         debug["rule"] = "EMPTY:None/NaN"
         return None, "EMPTY", debug
 
-    # 2) уже число
+    # already numeric
     if isinstance(val, (int, float)) and not pd.isna(val):
         f = float(val)
         debug["raw_str"] = str(val)
@@ -59,42 +56,47 @@ def parse_amount(val):
         debug["rule"] = "OK:already_numeric"
         return f, None, debug
 
-    # 3) строка (или любой другой тип -> строка)
-    raw = norm_text(val)
-    debug["raw_str"] = raw
+    s = norm_text(val)
+    debug["raw_str"] = s
 
-    if raw == "" or raw.lower() in {"-", "none", "nan"}:
+    if s == "" or s.lower() in {"-", "none", "nan"}:
         debug["rule"] = "EMPTY:blank_or_marker"
         return None, "EMPTY", debug
 
-    # 4) не-суммовые маркеры (важно: это НЕ ошибка)
-    if raw.lower() in {"да", "нет", "true", "false"}:
+    # common non-amount markers
+    if s.lower() in {"да", "нет", "true", "false"}:
         debug["rule"] = "NON_AMOUNT_MARKER"
         return None, "NON_AMOUNT", debug
 
-    s = raw
-
-    # 5) нормализация минусов (разные unicode-символы)
+    # normalize minus variants
     s = s.replace("−", "-").replace("–", "-").replace("—", "-")
 
-    # 6) скобки как отрицательное значение: (500) -> -500
+    # parentheses negative
     is_paren_negative = s.startswith("(") and s.endswith(")")
     if is_paren_negative:
         s = s[1:-1].strip()
         debug["rule"] = "RULE:paren_negative"
 
-    # 7) убрать валюты
-    s = re.sub(r"[₽$€]", "", s)
-
-    # 8) убрать пробелы (обычные + NBSP/узкий NBSP уже приведены norm_text к обычным)
+    # remove spaces (including NBSP variants)
+    s = s.replace("\u00A0", " ").replace("\u202F", " ")
     s = s.replace(" ", "")
 
-    # 9) минус в конце: 1000- -> -1000
-    if s.endswith("-") and s[:-1].replace(".", "").replace(",", "").isdigit():
+    # IMPORTANT: strip everything except digits, separators, and sign
+    # this removes ₽ $ € and any other letters/symbols safely
+    s = re.sub(r"[^0-9,\.\-\+]", "", s)
+
+    # if nothing numeric left -> not an amount
+    if not re.search(r"\d", s):
+        debug["rule"] = "NON_AMOUNT:no_digits"
+        debug["normalized"] = s
+        return None, "NON_AMOUNT", debug
+
+    # trailing minus: 1000- -> -1000
+    if s.endswith("-") and re.fullmatch(r"[0-9\.,]+-", s):
         s = "-" + s[:-1]
         debug["rule"] = (debug["rule"] + "|RULE:trailing_minus") if debug["rule"] else "RULE:trailing_minus"
 
-    # 10) разделители тысяч/десятичные: 1.234,56 vs 1,234.56
+    # handle mixed separators: 1.234,56 vs 1,234.56
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
             # EU: 1.234,56 -> 1234.56
@@ -106,14 +108,14 @@ def parse_amount(val):
             tag = "RULE:US_mixed_sep"
         debug["rule"] = (debug["rule"] + "|" + tag) if debug["rule"] else tag
     else:
-        # один разделитель или ни одного
+        # single sep: comma as decimal
         s = s.replace(",", ".")
         tag = "RULE:single_sep"
         debug["rule"] = (debug["rule"] + "|" + tag) if debug["rule"] else tag
 
     debug["normalized"] = s
 
-    # 11) финальная попытка
+    # final cast
     try:
         num = float(s)
         if is_paren_negative:
