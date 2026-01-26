@@ -370,29 +370,61 @@ def process_excel(uploaded_file):
         result_df["Дата ДДС"] = pd.to_datetime(result_df["Дата ДДС"], errors="coerce")
         result_df["Дата P&L"] = pd.to_datetime(result_df["Дата P&L"], errors="coerce")
     
-        # ====== СХЛОПЫВАНИЕ ОДИНАКОВЫХ СТРОК (кроме сумм) ======
-        # Источник_строка / Источник_колонка НЕ включаем в ключ, иначе не объединится
-        group_keys = ["Дата ДДС", "Дата P&L", "Статья операции", "Касса / Счет", "Комментарий"]
+        # ====== СХЛОПЫВАНИЕ: совпадает всё, кроме Комментария и суммы ======
     
         # гарантируем числа
         result_df["Приход"] = pd.to_numeric(result_df["Приход"], errors="coerce").fillna(0.0)
         result_df["Расход"] = pd.to_numeric(result_df["Расход"], errors="coerce").fillna(0.0)
     
-        # суммируем приход и расход отдельно
+        # тип строки, чтобы приход и расход не склеились
+        result_df["Тип"] = result_df.apply(
+            lambda r: "Приход" if r["Приход"] != 0 else ("Расход" if r["Расход"] != 0 else "Ноль"),
+            axis=1
+        )
+    
+        # убираем строки без суммы
+        result_df = result_df[result_df["Тип"] != "Ноль"].copy()
+    
+        # нормализуем комментарий
+        result_df["Комментарий"] = result_df["Комментарий"].fillna("").astype(str).str.strip()
+    
+        def join_comments(series: pd.Series) -> str:
+            seen = set()
+            out = []
+            for x in series.tolist():
+                x = (x or "").strip()
+                if not x:
+                    continue
+                if x not in seen:
+                    seen.add(x)
+                    out.append(x)
+            return "; ".join(out)
+    
+        # ключ: всё кроме Комментария и сумм
+        # Источник_* НЕ включаем
+        group_keys = ["Тип", "Дата ДДС", "Дата P&L", "Статья операции", "Касса / Счет"]
+    
         result_df = (
             result_df
-            .groupby(group_keys, dropna=False, as_index=False)[["Приход", "Расход"]]
-            .sum()
+            .groupby(group_keys, dropna=False, as_index=False)
+            .agg({
+                "Приход": "sum",
+                "Расход": "sum",
+                "Комментарий": join_comments
+            })
         )
     
         result_df["Приход"] = result_df["Приход"].round(2)
         result_df["Расход"] = result_df["Расход"].round(2)
     
-        # (опционально) убрать строки, где и приход, и расход = 0 после суммирования
+        # на всякий случай после суммирования убрать нули
         result_df = result_df[~((result_df["Приход"] == 0) & (result_df["Расход"] == 0))].copy()
     
-        # сортировка уже после схлопывания
-        result_df = result_df.sort_values(by=["Дата ДДС", "Дата P&L"]).reset_index(drop=True)
+        # сортировка после схлопывания
+        result_df = result_df.sort_values(by=["Дата ДДС", "Дата P&L", "Тип"]).reset_index(drop=True)
+    
+        # убрать технический столбец
+        result_df = result_df.drop(columns=["Тип"], errors="ignore")
     
     # Display df (human-friendly)
     # --- фиксируем порядок колонок ---
