@@ -395,6 +395,21 @@ def process_excel(uploaded_file):
         result_df = result_df.sort_values(by=["Дата ДДС", "Дата P&L"]).reset_index(drop=True)
     
     # Display df (human-friendly)
+    # --- фиксируем порядок колонок ---
+    desired_order = [
+        "Дата ДДС",
+        "Дата P&L",
+        "Приход",
+        "Расход",
+        "Статья операции",
+        "Касса / Счет",
+        "Комментарий",
+    ]
+    
+    # если какие-то колонки вдруг отсутствуют — не упадём
+    existing = [c for c in desired_order if c in result_df.columns]
+    result_df = result_df[existing]
+
     display_df = result_df.copy()
     if not display_df.empty:
         display_df["Дата ДДС"] = display_df["Дата ДДС"].dt.strftime("%d.%m.%Y").fillna("")
