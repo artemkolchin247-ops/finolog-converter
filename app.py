@@ -2,7 +2,6 @@ import pandas as pd
 import streamlit as st
 import re
 from io import BytesIO
-from datetime import datetime
 
 # =========================
 # Helpers
@@ -184,8 +183,6 @@ def process_excel(uploaded_file):
     df = df_raw.iloc[header_idx + 1:].copy()
     df.columns = headers
 
-    amount_cols = build_amount_columns(df)
-
     # Drop known irrelevant cols (tolerant: compare by normalized key)
     cols_to_drop_keys = {
         "№  п.п.",
@@ -215,7 +212,7 @@ def process_excel(uploaded_file):
         st.error("В таблице после заголовка нет колонки 'Дата операции' (проверь формат файла).")
         return None
 
-    amount_cols = build_amount_columns(df, df.columns)
+    amount_cols = build_amount_columns(df)
 
     result_rows = []
     error_rows = []
@@ -262,7 +259,7 @@ def process_excel(uploaded_file):
             income = round(value, 2) if value > 0 else 0.0
             expense = round(-value, 2) if value < 0 else 0.0
             
-            # если число есть, но после округления стало 0 — фиксируем как отдельную причину
+            # если число есть, но после округления стало 0 — логируем и НЕ добавляем в операции
             if income == 0.0 and expense == 0.0 and abs(value) > 0:
                 error_rows.append({
                     "Источник_строка": int(src_idx) + 1,
@@ -281,30 +278,11 @@ def process_excel(uploaded_file):
                     "Комментарий": description,
                 })
                 continue
-
-            income = round(value, 2) if value > 0 else 0.0
-            expense = round(-value, 2) if value < 0 else 0.0
-
-            # Keep zeros only if the original value was non-zero but rounded to zero
-            # (rare but avoids losing micro-values). If you want to drop strict zeros, revert this logic.
-            if income == 0.0 and expense == 0.0 and abs(value) > 0:
-                # store as warning record in errors instead of dropping
-                error_rows.append({
-                    "Источник_строка": int(src_idx) + 1,
-                    "Источник_колонка": norm_text(col),
-                    "Исходное значение": raw_val,
-                    "Ошибка": f"ROUNDED_TO_ZERO: {value}",
-                    "Дата ДДС (как в файле)": date_dds,
-                    "Дата P&L (как в файле)": date_pl,
-                    "Статья": article,
-                    "Комментарий": description,
-                })
-                continue
-
+            
             result_rows.append({
                 "Источник_строка": int(src_idx) + 1,
                 "Источник_колонка": norm_text(col),
-
+            
                 "Дата ДДС": date_dds,
                 "Дата P&L": date_pl,
                 "Приход": income,
@@ -482,7 +460,7 @@ if uploaded_file:
                         v = cell.value
                         max_len = max(max_len, len(str(v)) if v is not None else 0)
                     col_letter = ws.cell(row=1, column=idx).column_letter
-                    if header in {"Комментарий", "Ошибка", "Сырье"}:
+                    if header in {"Комментарий", "Лог", "Сумма_как_в_файле", "Сумма_нормализованная"}:
                         ws.column_dimensions[col_letter].width = 50
                     else:
                         ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
