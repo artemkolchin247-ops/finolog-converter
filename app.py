@@ -164,8 +164,6 @@ def build_amount_columns(df: pd.DataFrame, headers=None):
         "nan",
     }
     return [c for c in df.columns if norm_key(c) not in exclude_cols]
-amount_cols = build_amount_columns(df)
-
 # =========================
 # Core processing
 # =========================
@@ -185,6 +183,8 @@ def process_excel(uploaded_file):
 
     df = df_raw.iloc[header_idx + 1:].copy()
     df.columns = headers
+
+    amount_cols = build_amount_columns(df)
 
     # Drop known irrelevant cols (tolerant: compare by normalized key)
     cols_to_drop_keys = {
