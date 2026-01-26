@@ -359,18 +359,41 @@ def process_excel(uploaded_file):
         return None
 
     result_df = pd.DataFrame(result_rows) if result_rows else pd.DataFrame(
-        columns=["Источник_строка","Источник_колонка","Дата ДДС","Дата P&L","Приход","Расход","Статья операции","Касса / Счет","Комментарий"]
+    columns=["Источник_строка","Источник_колонка","Дата ДДС","Дата P&L","Приход","Расход","Статья операции","Касса / Счет","Комментарий"]
     )
     error_df = pd.DataFrame(error_rows) if error_rows else pd.DataFrame(
         columns=["Источник_строка","Источник_колонка","Сумма_как_в_файле","Сумма_нормализованная","Сумма_числом","Причина_пропуска","Лог","Дата ДДС (как в файле)","Дата P&L (как в файле)","Статья","Комментарий"]
     )
-
+    
     # Normalize dates for sorting/export
     if not result_df.empty:
         result_df["Дата ДДС"] = pd.to_datetime(result_df["Дата ДДС"], errors="coerce")
         result_df["Дата P&L"] = pd.to_datetime(result_df["Дата P&L"], errors="coerce")
-        result_df = result_df.sort_values(by=["Дата ДДС", "Источник_строка", "Источник_колонка"]).reset_index(drop=True)
-
+    
+        # ====== СХЛОПЫВАНИЕ ОДИНАКОВЫХ СТРОК (кроме сумм) ======
+        # Источник_строка / Источник_колонка НЕ включаем в ключ, иначе не объединится
+        group_keys = ["Дата ДДС", "Дата P&L", "Статья операции", "Касса / Счет", "Комментарий"]
+    
+        # гарантируем числа
+        result_df["Приход"] = pd.to_numeric(result_df["Приход"], errors="coerce").fillna(0.0)
+        result_df["Расход"] = pd.to_numeric(result_df["Расход"], errors="coerce").fillna(0.0)
+    
+        # суммируем приход и расход отдельно
+        result_df = (
+            result_df
+            .groupby(group_keys, dropna=False, as_index=False)[["Приход", "Расход"]]
+            .sum()
+        )
+    
+        result_df["Приход"] = result_df["Приход"].round(2)
+        result_df["Расход"] = result_df["Расход"].round(2)
+    
+        # (опционально) убрать строки, где и приход, и расход = 0 после суммирования
+        result_df = result_df[~((result_df["Приход"] == 0) & (result_df["Расход"] == 0))].copy()
+    
+        # сортировка уже после схлопывания
+        result_df = result_df.sort_values(by=["Дата ДДС", "Дата P&L"]).reset_index(drop=True)
+    
     # Display df (human-friendly)
     display_df = result_df.copy()
     if not display_df.empty:
@@ -378,7 +401,7 @@ def process_excel(uploaded_file):
         display_df["Дата P&L"] = display_df["Дата P&L"].dt.strftime("%d.%m.%Y").fillna("")
         display_df["Приход"] = display_df["Приход"].apply(lambda x: "" if x == 0 else x)
         display_df["Расход"] = display_df["Расход"].apply(lambda x: "" if x == 0 else x)
-
+    
     return display_df, result_df, error_df
 
 # =========================
