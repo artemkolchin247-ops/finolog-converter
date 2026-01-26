@@ -30,29 +30,36 @@ def get_scalar(value):
 
 def parse_amount(val):
     """
-    Returns:
-      value: float|None
-      reason: str|None  (machine-readable reason)
-      debug: dict       (detailed log)
+    Универсальный парсер сумм из Excel.
+
+    Возвращает:
+      value: float | None
+      reason: str | None        # None = успешно, иначе причина пропуска/ошибки
+      debug: dict               # подробный лог преобразований
     """
+
     debug = {
-        "raw": val,
-        "raw_str": None,
-        "normalized": None,
-        "rule": None,
-        "exception": None,
+        "raw": val,                 # исходное значение (как пришло из pandas)
+        "raw_str": None,            # строковое представление после norm_text
+        "normalized": None,         # строка после чистки/нормализации
+        "rule": None,               # какие правила сработали
+        "exception": None,          # исключение, если было
     }
 
+    # 1) пусто / NaN
     if val is None or (isinstance(val, float) and pd.isna(val)):
         debug["rule"] = "EMPTY:None/NaN"
         return None, "EMPTY", debug
 
+    # 2) уже число
     if isinstance(val, (int, float)) and not pd.isna(val):
-        debug["rule"] = "OK:already_numeric"
+        f = float(val)
         debug["raw_str"] = str(val)
-        debug["normalized"] = str(float(val))
-        return float(val), None, debug
+        debug["normalized"] = str(f)
+        debug["rule"] = "OK:already_numeric"
+        return f, None, debug
 
+    # 3) строка (или любой другой тип -> строка)
     raw = norm_text(val)
     debug["raw_str"] = raw
 
@@ -60,45 +67,58 @@ def parse_amount(val):
         debug["rule"] = "EMPTY:blank_or_marker"
         return None, "EMPTY", debug
 
-    # normalize unicode minus variants
-    s = raw.replace("−", "-").replace("–", "-").replace("—", "-")
+    # 4) не-суммовые маркеры (важно: это НЕ ошибка)
+    if raw.lower() in {"да", "нет", "true", "false"}:
+        debug["rule"] = "NON_AMOUNT_MARKER"
+        return None, "NON_AMOUNT", debug
 
-    # parentheses negatives
+    s = raw
+
+    # 5) нормализация минусов (разные unicode-символы)
+    s = s.replace("−", "-").replace("–", "-").replace("—", "-")
+
+    # 6) скобки как отрицательное значение: (500) -> -500
     is_paren_negative = s.startswith("(") and s.endswith(")")
     if is_paren_negative:
-        debug["rule"] = "RULE:paren_negative"
         s = s[1:-1].strip()
+        debug["rule"] = "RULE:paren_negative"
 
-    # remove currency symbols
+    # 7) убрать валюты
     s = re.sub(r"[₽$€]", "", s)
 
-    # remove spaces (incl. NBSP already normalized in norm_text)
+    # 8) убрать пробелы (обычные + NBSP/узкий NBSP уже приведены norm_text к обычным)
     s = s.replace(" ", "")
 
-    # trailing minus: 1000- -> -1000
+    # 9) минус в конце: 1000- -> -1000
     if s.endswith("-") and s[:-1].replace(".", "").replace(",", "").isdigit():
-        debug["rule"] = "RULE:trailing_minus"
         s = "-" + s[:-1]
+        debug["rule"] = (debug["rule"] + "|RULE:trailing_minus") if debug["rule"] else "RULE:trailing_minus"
 
-    # handle separators
+    # 10) разделители тысяч/десятичные: 1.234,56 vs 1,234.56
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
-            debug["rule"] = (debug["rule"] or "") + "|RULE:EU_mixed_sep"
+            # EU: 1.234,56 -> 1234.56
             s = s.replace(".", "").replace(",", ".")
+            tag = "RULE:EU_mixed_sep"
         else:
-            debug["rule"] = (debug["rule"] or "") + "|RULE:US_mixed_sep"
+            # US: 1,234.56 -> 1234.56
             s = s.replace(",", "")
+            tag = "RULE:US_mixed_sep"
+        debug["rule"] = (debug["rule"] + "|" + tag) if debug["rule"] else tag
     else:
-        debug["rule"] = (debug["rule"] or "") + "|RULE:single_sep"
+        # один разделитель или ни одного
         s = s.replace(",", ".")
+        tag = "RULE:single_sep"
+        debug["rule"] = (debug["rule"] + "|" + tag) if debug["rule"] else tag
 
     debug["normalized"] = s
 
+    # 11) финальная попытка
     try:
         num = float(s)
         if is_paren_negative:
             num = -abs(num)
-        debug["rule"] = "OK:parsed" if debug["rule"] is None else ("OK:parsed|" + debug["rule"])
+        debug["rule"] = ("OK:parsed|" + debug["rule"]) if debug["rule"] else "OK:parsed"
         return num, None, debug
     except Exception as e:
         debug["rule"] = "FAIL:float_cast"
@@ -116,24 +136,43 @@ def detect_header_row(df_raw: pd.DataFrame) -> int | None:
             return i
     return None
 
-def build_amount_columns(headers):
+def build_amount_columns(df: pd.DataFrame, headers):
     """
-    Identify columns that can contain amounts.
-    Exclude known text/date columns, tolerant to case/spaces.
+    Keep only columns that look like amount columns:
+    - exclude known non-amount fields
+    - and require at least N successfully parsed numeric cells among first sample rows
     """
     exclude = {
-        "дата операции",
-        "описание",
-        "статья",
-        "дата начисления",
-        "",
-        "nan",
+        "дата операции", "описание", "статья", "дата начисления", "", "nan",
     }
+
+    # sample first rows to infer column type
+    sample = df.head(200)
+
     amount_cols = []
     for h in headers:
         k = norm_key(h)
-        if k not in exclude:
+        if k in exclude:
+            continue
+
+        # check how many non-empty cells parse as numbers
+        ok = 0
+        nonempty = 0
+        for v in sample[h].tolist():
+            v0 = get_scalar(v)
+            s = norm_text(v0)
+            if s == "" or s.lower() in {"-", "none", "nan"}:
+                continue
+            nonempty += 1
+            val, reason, _ = parse_amount(v0)
+            if reason is None and val is not None:
+                ok += 1
+
+        # rule: treat as amount column if it has at least 3 numeric cells
+        # and numeric share is decent (>= 30%) among non-empty in sample
+        if ok >= 3 and (nonempty == 0 or ok / max(nonempty, 1) >= 0.30):
             amount_cols.append(h)
+
     return amount_cols
 
 # =========================
@@ -184,7 +223,7 @@ def process_excel(uploaded_file):
         st.error("В таблице после заголовка нет колонки 'Дата операции' (проверь формат файла).")
         return None
 
-    amount_cols = build_amount_columns(df.columns)
+    amount_cols = build_amount_columns(df, df.columns)
 
     result_rows = []
     error_rows = []
