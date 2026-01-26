@@ -125,6 +125,22 @@ def parse_amount(val):
         debug["exception"] = repr(e)
         return None, "PARSE_FAIL", debug
 
+def make_unique_columns(cols):
+    seen = {}
+    out = []
+
+    for c in cols:
+        c = norm_text(c)
+
+        if c not in seen:
+            seen[c] = 1
+            out.append(c)
+        else:
+            seen[c] += 1
+            out.append(f"{c} #{seen[c]}")
+
+    return out
+    
 def detect_header_row(df_raw: pd.DataFrame) -> int | None:
     """
     Find row index that contains 'Дата операции' (case-insensitive, tolerant to spaces).
@@ -205,6 +221,7 @@ def process_excel(uploaded_file):
 
     # Build headers from that row (keep original names, but strip)
     headers = df_raw.iloc[header_idx].apply(norm_text)
+    headers = make_unique_columns(headers)
 
     df = df_raw.iloc[header_idx + 1:].copy()
     df.columns = headers
