@@ -138,38 +138,53 @@ def detect_header_row(df_raw: pd.DataFrame) -> int | None:
 
 def build_amount_columns(df: pd.DataFrame, headers):
     """
-    Keep only columns that look like amount columns:
-    - exclude known non-amount fields
-    - and require at least N successfully parsed numeric cells among first sample rows
+    Определяет денежные колонки автоматически.
+    Корректно работает даже при дублирующихся названиях столбцов.
     """
+
     exclude = {
-        "дата операции", "описание", "статья", "дата начисления", "", "nan",
+        "дата операции",
+        "описание",
+        "статья",
+        "дата начисления",
+        "",
+        "nan",
     }
 
-    # sample first rows to infer column type
     sample = df.head(200)
 
     amount_cols = []
+
     for h in headers:
-        k = norm_key(h)
-        if k in exclude:
+        if norm_key(h) in exclude:
             continue
 
-        # check how many non-empty cells parse as numbers
+        col_data = sample.loc[:, h]
+
+        # если несколько колонок с одинаковым именем — берём их все
+        if isinstance(col_data, pd.DataFrame):
+            values = []
+            for _, s in col_data.items():
+                values.extend(s.tolist())
+        else:
+            values = col_data.tolist()
+
         ok = 0
         nonempty = 0
-        for v in sample[h].tolist():
-            v0 = get_scalar(v)
-            s = norm_text(v0)
+
+        for v in values:
+            s = norm_text(v)
             if s == "" or s.lower() in {"-", "none", "nan"}:
                 continue
+
             nonempty += 1
-            val, reason, _ = parse_amount(v0)
+            val, reason, _ = parse_amount(v)
             if reason is None and val is not None:
                 ok += 1
 
-        # rule: treat as amount column if it has at least 3 numeric cells
-        # and numeric share is decent (>= 30%) among non-empty in sample
+        # колонка считается денежной, если:
+        # - есть хотя бы 3 числа
+        # - и минимум 30% непустых значений — числовые
         if ok >= 3 and (nonempty == 0 or ok / max(nonempty, 1) >= 0.30):
             amount_cols.append(h)
 
