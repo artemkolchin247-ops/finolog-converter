@@ -347,18 +347,27 @@ def process_excel(uploaded_file):
                     })
                 result_df = result_df[~invalid_mask].copy()
     
-        # тип строки, чтобы приход и расход не склеились
-        result_df["Тип"] = result_df.apply(
-            lambda r: "Приход" if r["Приход"] != _zero_d else ("Расход" if r["Расход"] != _zero_d else "Ноль"),
-            axis=1
-        )
-    
         # убираем строки без суммы
-        result_df = result_df[result_df["Тип"] != "Ноль"].copy()
-    
+        result_df = result_df[~((result_df["Приход"] == _zero_d) & (result_df["Расход"] == _zero_d))].copy()
+
         # нормализуем комментарий
         result_df["Комментарий"] = result_df["Комментарий"].fillna("").astype(str).str.strip()
-    
+
+        # ====== СЕЛЕКТИВНАЯ АГРЕГАЦИЯ ======
+        # Крупные операции (≥1000) идут отдельными строками.
+        # Мелкие (<1000) и "Перевод между счетами" — схлопываются.
+
+        _agg_limit = Decimal("1000")
+        result_df["_amount"] = result_df[["Приход", "Расход"]].max(axis=1)
+        result_df["_is_agg"] = (
+            (result_df["_amount"] < _agg_limit) |
+            (result_df["Статья операции"] == "Перевод между счетами")
+        )
+
+        df_solo = result_df[~result_df["_is_agg"]].copy()
+        df_to_agg = result_df[result_df["_is_agg"]].copy()
+
+        # --- Агрегация мелких / переводов ---
         def join_comments(series: pd.Series) -> str:
             seen = set()
             out = []
@@ -374,41 +383,48 @@ def process_excel(uploaded_file):
         def decimal_sum(series: pd.Series) -> Decimal:
             """Суммирование через Python sum — Decimal-safe, без конвертации в float."""
             return sum(series.tolist(), Decimal(0))
-    
-        # ключ: всё кроме Комментария и сумм
-        # Источник_* НЕ включаем
-        group_keys = ["Тип", "Дата ДДС", "Дата P&L", "Статья операции", "Касса / Счет"]
-    
-        result_df = (
-            result_df
-            .groupby(group_keys, dropna=False, as_index=False)
-            .agg({
-                "Приход": decimal_sum,
-                "Расход": decimal_sum,
-                "Комментарий": join_comments
-            })
-        )
-    
-        # Финальное округление — Decimal-safe
-        result_df["Приход"] = result_df["Приход"].apply(
-            lambda v: v.quantize(_two_places, rounding=ROUND_HALF_UP) if isinstance(v, Decimal) else Decimal(0)
-        )
-        result_df["Расход"] = result_df["Расход"].apply(
-            lambda v: v.quantize(_two_places, rounding=ROUND_HALF_UP) if isinstance(v, Decimal) else Decimal(0)
-        )
-    
-        # на всякий случай после суммирования убрать нули
+
+        group_keys = ["Дата ДДС", "Дата P&L", "Статья операции", "Касса / Счет"]
+
+        if not df_to_agg.empty:
+            df_grouped = (
+                df_to_agg
+                .groupby(group_keys, dropna=False, as_index=False)
+                .agg({
+                    "Приход": decimal_sum,
+                    "Расход": decimal_sum,
+                    "Комментарий": join_comments
+                })
+            )
+            # Финальное округление агрегированных сумм
+            df_grouped["Приход"] = df_grouped["Приход"].apply(
+                lambda v: v.quantize(_two_places, rounding=ROUND_HALF_UP) if isinstance(v, Decimal) else Decimal(0)
+            )
+            df_grouped["Расход"] = df_grouped["Расход"].apply(
+                lambda v: v.quantize(_two_places, rounding=ROUND_HALF_UP) if isinstance(v, Decimal) else Decimal(0)
+            )
+            # Источник_строка для агрегированных строк — пусто (несколько строк склеены)
+            df_grouped["Источник_строка"] = ""
+            df_grouped["Источник_колонка"] = ""
+        else:
+            df_grouped = pd.DataFrame()
+
+        # --- Объединяем соло + агрегированные ---
+        result_df = pd.concat([df_solo, df_grouped], ignore_index=True)
+
+        # убираем нулевые строки после агрегации
         result_df = result_df[~((result_df["Приход"] == _zero_d) & (result_df["Расход"] == _zero_d))].copy()
-    
-        # сортировка после схлопывания
-        result_df = result_df.sort_values(by=["Дата ДДС", "Дата P&L", "Тип"]).reset_index(drop=True)
-    
-        # убрать технический столбец
-        result_df = result_df.drop(columns=["Тип"], errors="ignore")
-    
+
+        # убираем технические колонки
+        result_df = result_df.drop(columns=["_amount", "_is_agg"], errors="ignore")
+
+        # сортировка
+        result_df = result_df.sort_values(by=["Дата ДДС", "Дата P&L"]).reset_index(drop=True)
+
     # Display df (human-friendly)
     # --- фиксируем порядок колонок ---
     desired_order = [
+        "Источник_строка",
         "Дата ДДС",
         "Дата P&L",
         "Приход",
