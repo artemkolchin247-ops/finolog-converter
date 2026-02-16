@@ -2,6 +2,7 @@ import pandas as pd
 import streamlit as st
 import re
 from io import BytesIO
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 
 # =========================
 # Helpers
@@ -12,8 +13,8 @@ def norm_text(x) -> str:
     if x is None:
         return ""
     s = str(x)
-    # normalize spaces (regular + NBSP + narrow NBSP)
-    s = s.replace("\u00A0", " ").replace("\u202F", " ")
+    # normalize spaces (regular + NBSP + narrow NBSP + thin space)
+    s = s.replace("\u00A0", " ").replace("\u202F", " ").replace("\u2009", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -30,7 +31,7 @@ def get_scalar(value):
 def parse_amount(val):
     """
     Возвращает:
-      value: float | None
+      value: Decimal | None
       reason: str | None   # None = успешно; EMPTY/NON_AMOUNT/PARSE_FAIL = не сумма
       debug: dict
     """
@@ -47,13 +48,18 @@ def parse_amount(val):
         debug["rule"] = "EMPTY:None/NaN"
         return None, "EMPTY", debug
 
-    # already numeric
+    # already numeric — через str, чтобы избежать float-артефактов
     if isinstance(val, (int, float)) and not pd.isna(val):
-        f = float(val)
-        debug["raw_str"] = str(val)
-        debug["normalized"] = str(f)
-        debug["rule"] = "OK:already_numeric"
-        return f, None, debug
+        try:
+            d = Decimal(str(val))
+            debug["raw_str"] = str(val)
+            debug["normalized"] = str(d)
+            debug["rule"] = "OK:already_numeric"
+            return d, None, debug
+        except InvalidOperation as e:
+            debug["rule"] = "FAIL:decimal_cast"
+            debug["exception"] = repr(e)
+            return None, "PARSE_FAIL", debug
 
     s = norm_text(val)
     debug["raw_str"] = s
@@ -68,7 +74,7 @@ def parse_amount(val):
         return None, "NON_AMOUNT", debug
 
     # normalize minus variants
-    s = s.replace("−", "-").replace("–", "-").replace("—", "-")
+    s = s.replace("\u2212", "-").replace("\u2013", "-").replace("\u2014", "-")
 
     # parentheses negative
     is_paren_negative = s.startswith("(") and s.endswith(")")
@@ -76,9 +82,12 @@ def parse_amount(val):
         s = s[1:-1].strip()
         debug["rule"] = "RULE:paren_negative"
 
-    # remove spaces (including NBSP variants)
-    s = s.replace("\u00A0", " ").replace("\u202F", " ")
+    # remove spaces (including NBSP variants + thin space)
+    s = s.replace("\u00A0", "").replace("\u202F", "").replace("\u2009", "")
     s = s.replace(" ", "")
+
+    # remove apostrophes (швейцарский формат 1'000)
+    s = s.replace("\u2019", "").replace("'", "")
 
     # IMPORTANT: strip everything except digits, separators, and sign
     # this removes ₽ $ € and any other letters/symbols safely
@@ -114,15 +123,15 @@ def parse_amount(val):
 
     debug["normalized"] = s
 
-    # final cast
+    # final cast — Decimal
     try:
-        num = float(s)
+        num = Decimal(s)
         if is_paren_negative:
             num = -abs(num)
         debug["rule"] = ("OK:parsed|" + debug["rule"]) if debug["rule"] else "OK:parsed"
         return num, None, debug
-    except Exception as e:
-        debug["rule"] = "FAIL:float_cast"
+    except (InvalidOperation, ValueError) as e:
+        debug["rule"] = "FAIL:decimal_cast"
         debug["exception"] = repr(e)
         return None, "PARSE_FAIL", debug
 
@@ -256,11 +265,13 @@ def process_excel(uploaded_file):
                 })
                 continue
             
-            income = round(value, 2) if value > 0 else 0.0
-            expense = round(-value, 2) if value < 0 else 0.0
+            _zero = Decimal(0)
+            _two_places = Decimal("0.01")
+            income = value.quantize(_two_places, rounding=ROUND_HALF_UP) if value > _zero else _zero
+            expense = (-value).quantize(_two_places, rounding=ROUND_HALF_UP) if value < _zero else _zero
             
             # если число есть, но после округления стало 0 — логируем и НЕ добавляем в операции
-            if income == 0.0 and expense == 0.0 and abs(value) > 0:
+            if income == _zero and expense == _zero and abs(value) > _zero:
                 error_rows.append({
                     "Источник_строка": int(src_idx) + 1,
                     "Источник_колонка": norm_text(col),
@@ -310,13 +321,35 @@ def process_excel(uploaded_file):
     
         # ====== СХЛОПЫВАНИЕ: совпадает всё, кроме Комментария и суммы ======
     
-        # гарантируем числа
-        result_df["Приход"] = pd.to_numeric(result_df["Приход"], errors="coerce").fillna(0.0)
-        result_df["Расход"] = pd.to_numeric(result_df["Расход"], errors="coerce").fillna(0.0)
+        # Строгая проверка: если в колонку попало не-Decimal — логируем и удаляем
+        _zero_d = Decimal(0)
+        _two_places = Decimal("0.01")
+
+        for col_name in ["Приход", "Расход"]:
+            invalid_mask = result_df[col_name].apply(
+                lambda v: not isinstance(v, (Decimal, int)) or (isinstance(v, float) and pd.isna(v))
+            )
+            if invalid_mask.any():
+                for idx in result_df[invalid_mask].index:
+                    bad_row = result_df.loc[idx]
+                    error_rows.append({
+                        "Источник_строка": bad_row.get("Источник_строка", "N/A"),
+                        "Источник_колонка": bad_row.get("Источник_колонка", "N/A"),
+                        "Сумма_как_в_файле": str(bad_row[col_name]),
+                        "Сумма_нормализованная": "",
+                        "Сумма_числом": "",
+                        "Причина_пропуска": "INVALID_TYPE_BEFORE_AGG",
+                        "Лог": f"Колонка '{col_name}': тип {type(bad_row[col_name]).__name__}, значение={bad_row[col_name]}",
+                        "Дата ДДС (как в файле)": bad_row.get("Дата ДДС", ""),
+                        "Дата P&L (как в файле)": bad_row.get("Дата P&L", ""),
+                        "Статья": bad_row.get("Статья операции", ""),
+                        "Комментарий": bad_row.get("Комментарий", ""),
+                    })
+                result_df = result_df[~invalid_mask].copy()
     
         # тип строки, чтобы приход и расход не склеились
         result_df["Тип"] = result_df.apply(
-            lambda r: "Приход" if r["Приход"] != 0 else ("Расход" if r["Расход"] != 0 else "Ноль"),
+            lambda r: "Приход" if r["Приход"] != _zero_d else ("Расход" if r["Расход"] != _zero_d else "Ноль"),
             axis=1
         )
     
@@ -337,6 +370,10 @@ def process_excel(uploaded_file):
                     seen.add(x)
                     out.append(x)
             return "; ".join(out)
+
+        def decimal_sum(series: pd.Series) -> Decimal:
+            """Суммирование через Python sum — Decimal-safe, без конвертации в float."""
+            return sum(series.tolist(), Decimal(0))
     
         # ключ: всё кроме Комментария и сумм
         # Источник_* НЕ включаем
@@ -346,17 +383,22 @@ def process_excel(uploaded_file):
             result_df
             .groupby(group_keys, dropna=False, as_index=False)
             .agg({
-                "Приход": "sum",
-                "Расход": "sum",
+                "Приход": decimal_sum,
+                "Расход": decimal_sum,
                 "Комментарий": join_comments
             })
         )
     
-        result_df["Приход"] = result_df["Приход"].round(2)
-        result_df["Расход"] = result_df["Расход"].round(2)
+        # Финальное округление — Decimal-safe
+        result_df["Приход"] = result_df["Приход"].apply(
+            lambda v: v.quantize(_two_places, rounding=ROUND_HALF_UP) if isinstance(v, Decimal) else Decimal(0)
+        )
+        result_df["Расход"] = result_df["Расход"].apply(
+            lambda v: v.quantize(_two_places, rounding=ROUND_HALF_UP) if isinstance(v, Decimal) else Decimal(0)
+        )
     
         # на всякий случай после суммирования убрать нули
-        result_df = result_df[~((result_df["Приход"] == 0) & (result_df["Расход"] == 0))].copy()
+        result_df = result_df[~((result_df["Приход"] == _zero_d) & (result_df["Расход"] == _zero_d))].copy()
     
         # сортировка после схлопывания
         result_df = result_df.sort_values(by=["Дата ДДС", "Дата P&L", "Тип"]).reset_index(drop=True)
@@ -380,12 +422,13 @@ def process_excel(uploaded_file):
     existing = [c for c in desired_order if c in result_df.columns]
     result_df = result_df[existing]
 
+    # Decimal -> float для отображения в Streamlit (st.dataframe не поддерживает Decimal)
     display_df = result_df.copy()
     if not display_df.empty:
         display_df["Дата ДДС"] = display_df["Дата ДДС"].dt.strftime("%d.%m.%Y").fillna("")
         display_df["Дата P&L"] = display_df["Дата P&L"].dt.strftime("%d.%m.%Y").fillna("")
-        display_df["Приход"] = display_df["Приход"].apply(lambda x: "" if x == 0 else x)
-        display_df["Расход"] = display_df["Расход"].apply(lambda x: "" if x == 0 else x)
+        display_df["Приход"] = display_df["Приход"].apply(lambda x: "" if x == Decimal(0) else float(x))
+        display_df["Расход"] = display_df["Расход"].apply(lambda x: "" if x == Decimal(0) else float(x))
     
     return display_df, result_df, error_df
 
@@ -425,13 +468,18 @@ if uploaded_file:
         # ========== Export to Excel ==========
         output_buffer = BytesIO()
 
-        # Prepare export: dates as strings, zeros as blanks (as you wanted)
+        # Prepare export: даты как строки, суммы Decimal→float для openpyxl
         export_for_excel = export_df.copy()
         if not export_for_excel.empty:
             export_for_excel["Дата ДДС"] = pd.to_datetime(export_for_excel["Дата ДДС"], errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
             export_for_excel["Дата P&L"] = pd.to_datetime(export_for_excel["Дата P&L"], errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
-            export_for_excel["Приход"] = export_for_excel["Приход"].apply(lambda x: "" if x == 0 else x)
-            export_for_excel["Расход"] = export_for_excel["Расход"].apply(lambda x: "" if x == 0 else x)
+            # Decimal → float (openpyxl не пишет Decimal), нули оставляем как 0
+            export_for_excel["Приход"] = export_for_excel["Приход"].apply(
+                lambda x: float(x) if isinstance(x, Decimal) else (x if x else 0)
+            )
+            export_for_excel["Расход"] = export_for_excel["Расход"].apply(
+                lambda x: float(x) if isinstance(x, Decimal) else (x if x else 0)
+            )
 
         # Filename from DDS dates
         if export_df.empty or export_df["Дата ДДС"].dropna().empty:
@@ -449,6 +497,21 @@ if uploaded_file:
             # Sheet 2: errors
             if not error_df.empty:
                 error_df.to_excel(writer, index=False, sheet_name="Ошибки")
+
+            # --- Кастомный числовой формат: 0 отображается как пустая ячейка ---
+            ws_ops = writer.sheets["Операции"]
+            header_row = [cell.value for cell in ws_ops[1]]
+            income_col_idx = (header_row.index("Приход") + 1) if "Приход" in header_row else None
+            expense_col_idx = (header_row.index("Расход") + 1) if "Расход" in header_row else None
+            # Формат: число с 2 знаками; 0 → визуально пусто; ячейка остается Numeric
+            zero_hidden_fmt = '#,##0.00;-#,##0.00;""'
+            for row_idx in range(2, ws_ops.max_row + 1):
+                if income_col_idx:
+                    cell = ws_ops.cell(row=row_idx, column=income_col_idx)
+                    cell.number_format = zero_hidden_fmt
+                if expense_col_idx:
+                    cell = ws_ops.cell(row=row_idx, column=expense_col_idx)
+                    cell.number_format = zero_hidden_fmt
 
             # Autosize columns (basic)
             for sheet_name in writer.sheets:
