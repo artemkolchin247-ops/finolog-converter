@@ -424,7 +424,6 @@ def process_excel(uploaded_file):
     # Display df (human-friendly)
     # --- фиксируем порядок колонок ---
     desired_order = [
-        "Источник_строка",
         "Дата ДДС",
         "Дата P&L",
         "Приход",
