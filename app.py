@@ -172,6 +172,7 @@ def build_amount_columns(df: pd.DataFrame, headers=None):
         "nan",
     }
     return [c for c in df.columns if norm_key(c) not in exclude_cols]
+
 # =========================
 # Core processing
 # =========================
@@ -308,7 +309,7 @@ def process_excel(uploaded_file):
         return None
 
     result_df = pd.DataFrame(result_rows) if result_rows else pd.DataFrame(
-    columns=["Источник_строка","Источник_колонка","Дата ДДС","Дата P&L","Приход","Расход","Статья операции","Касса / Счет","Комментарий"]
+        columns=["Источник_строка","Источник_колонка","Дата ДДС","Дата P&L","Приход","Расход","Статья операции","Касса / Счет","Комментарий"]
     )
     error_df = pd.DataFrame(error_rows) if error_rows else pd.DataFrame(
         columns=["Источник_строка","Источник_колонка","Сумма_как_в_файле","Сумма_нормализованная","Сумма_числом","Причина_пропуска","Лог","Дата ДДС (как в файле)","Дата P&L (как в файле)","Статья","Комментарий"]
@@ -318,13 +319,11 @@ def process_excel(uploaded_file):
     if not result_df.empty:
         result_df["Дата ДДС"] = pd.to_datetime(result_df["Дата ДДС"], errors="coerce")
         result_df["Дата P&L"] = pd.to_datetime(result_df["Дата P&L"], errors="coerce")
-    
-        # ====== СХЛОПЫВАНИЕ: совпадает всё, кроме Комментария и суммы ======
-    
-        # Строгая проверка: если в колонку попало не-Decimal — логируем и удаляем
+
         _zero_d = Decimal(0)
         _two_places = Decimal("0.01")
 
+        # Строгая проверка: если в колонку попало не-Decimal — логируем и удаляем
         for col_name in ["Приход", "Расход"]:
             invalid_mask = result_df[col_name].apply(
                 lambda v: not isinstance(v, (Decimal, int)) or (isinstance(v, float) and pd.isna(v))
@@ -346,82 +345,16 @@ def process_excel(uploaded_file):
                         "Комментарий": bad_row.get("Комментарий", ""),
                     })
                 result_df = result_df[~invalid_mask].copy()
-    
+
         # убираем строки без суммы
         result_df = result_df[~((result_df["Приход"] == _zero_d) & (result_df["Расход"] == _zero_d))].copy()
 
         # нормализуем комментарий
         result_df["Комментарий"] = result_df["Комментарий"].fillna("").astype(str).str.strip()
 
-        # ====== СЕЛЕКТИВНАЯ АГРЕГАЦИЯ ======
-        # Крупные операции (≥1000) идут отдельными строками.
-        # Мелкие (<1000) и "Перевод между счетами" — схлопываются.
-
-        _agg_limit = Decimal("1000")
-        result_df["_amount"] = result_df[["Приход", "Расход"]].max(axis=1)
-        result_df["_is_agg"] = (
-            (result_df["_amount"] < _agg_limit) |
-            (result_df["Статья операции"] == "Перевод между счетами")
-        )
-
-        df_solo = result_df[~result_df["_is_agg"]].copy()
-        df_to_agg = result_df[result_df["_is_agg"]].copy()
-
-        # --- Агрегация мелких / переводов ---
-        def join_comments(series: pd.Series) -> str:
-            seen = set()
-            out = []
-            for x in series.tolist():
-                x = (x or "").strip()
-                if not x:
-                    continue
-                if x not in seen:
-                    seen.add(x)
-                    out.append(x)
-            return "; ".join(out)
-
-        def decimal_sum(series: pd.Series) -> Decimal:
-            """Суммирование через Python sum — Decimal-safe, без конвертации в float."""
-            return sum(series.tolist(), Decimal(0))
-
-        group_keys = ["Дата ДДС", "Дата P&L", "Статья операции", "Касса / Счет"]
-
-        if not df_to_agg.empty:
-            df_grouped = (
-                df_to_agg
-                .groupby(group_keys, dropna=False, as_index=False)
-                .agg({
-                    "Приход": decimal_sum,
-                    "Расход": decimal_sum,
-                    "Комментарий": join_comments
-                })
-            )
-            # Финальное округление агрегированных сумм
-            df_grouped["Приход"] = df_grouped["Приход"].apply(
-                lambda v: v.quantize(_two_places, rounding=ROUND_HALF_UP) if isinstance(v, Decimal) else Decimal(0)
-            )
-            df_grouped["Расход"] = df_grouped["Расход"].apply(
-                lambda v: v.quantize(_two_places, rounding=ROUND_HALF_UP) if isinstance(v, Decimal) else Decimal(0)
-            )
-            # Источник_строка для агрегированных строк — пусто (несколько строк склеены)
-            df_grouped["Источник_строка"] = ""
-            df_grouped["Источник_колонка"] = ""
-        else:
-            df_grouped = pd.DataFrame()
-
-        # --- Объединяем соло + агрегированные ---
-        result_df = pd.concat([df_solo, df_grouped], ignore_index=True)
-
-        # убираем нулевые строки после агрегации
-        result_df = result_df[~((result_df["Приход"] == _zero_d) & (result_df["Расход"] == _zero_d))].copy()
-
-        # убираем технические колонки
-        result_df = result_df.drop(columns=["_amount", "_is_agg"], errors="ignore")
-
         # сортировка
         result_df = result_df.sort_values(by=["Дата ДДС", "Дата P&L"]).reset_index(drop=True)
 
-    # Display df (human-friendly)
     # --- фиксируем порядок колонок ---
     desired_order = [
         "Дата ДДС",
@@ -433,11 +366,10 @@ def process_excel(uploaded_file):
         "Комментарий",
     ]
     
-    # если какие-то колонки вдруг отсутствуют — не упадём
     existing = [c for c in desired_order if c in result_df.columns]
     result_df = result_df[existing]
 
-    # Decimal -> float для отображения в Streamlit (st.dataframe не поддерживает Decimal)
+    # Decimal -> float для отображения в Streamlit
     display_df = result_df.copy()
     if not display_df.empty:
         display_df["Дата ДДС"] = display_df["Дата ДДС"].dt.strftime("%d.%m.%Y").fillna("")
@@ -488,7 +420,6 @@ if uploaded_file:
         if not export_for_excel.empty:
             export_for_excel["Дата ДДС"] = pd.to_datetime(export_for_excel["Дата ДДС"], errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
             export_for_excel["Дата P&L"] = pd.to_datetime(export_for_excel["Дата P&L"], errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
-            # Decimal → float (openpyxl не пишет Decimal), нули оставляем как 0
             export_for_excel["Приход"] = export_for_excel["Приход"].apply(
                 lambda x: float(x) if isinstance(x, Decimal) else (x if x else 0)
             )
@@ -518,7 +449,6 @@ if uploaded_file:
             header_row = [cell.value for cell in ws_ops[1]]
             income_col_idx = (header_row.index("Приход") + 1) if "Приход" in header_row else None
             expense_col_idx = (header_row.index("Расход") + 1) if "Расход" in header_row else None
-            # Формат: число с 2 знаками; 0 → визуально пусто; ячейка остается Numeric
             zero_hidden_fmt = '#,##0.00;-#,##0.00;""'
             for row_idx in range(2, ws_ops.max_row + 1):
                 if income_col_idx:
