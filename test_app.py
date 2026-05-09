@@ -1,344 +1,377 @@
 """
-Unit-тесты для финансовой точности конвертера.
-Запуск: pytest test_app.py -v
+Unit tests for the Finolog converter.
+
+Run:
+    pytest test_app.py -v
 """
-import pytest
-import pandas as pd
+
+import sys
 from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
-from openpyxl import load_workbook
+from types import ModuleType
 
-# Импортируем тестируемые функции напрямую
-from app import parse_amount, norm_text
+import pandas as pd
+import pytest
+from openpyxl import Workbook, load_workbook
 
 
-# ============================================================
-# 1. Парсинг форматов
-# ============================================================
+class _StreamlitStub(ModuleType):
+    """Small Streamlit stub so tests can import app.py without running UI."""
 
-class TestParseAmountFormats:
-    """Тесты для различных числовых форматов."""
+    def __init__(self):
+        super().__init__("streamlit")
+        self.messages = []
 
-    def test_swiss_apostrophe(self):
-        """Швейцарский формат: 1'000.00"""
-        val, reason, _ = parse_amount("1'000.00")
-        assert reason is None
-        assert val == Decimal("1000.00")
+    def set_page_config(self, *args, **kwargs):
+        return None
 
-    def test_swiss_apostrophe_typographic(self):
-        """Типографский апостроф: 1\u2019000.00"""
-        val, reason, _ = parse_amount("1\u2019000.00")
-        assert reason is None
-        assert val == Decimal("1000.00")
+    def title(self, *args, **kwargs):
+        return None
 
-    def test_accounting_parentheses(self):
-        """Бухгалтерские скобки: (500) = -500"""
-        val, reason, _ = parse_amount("(500)")
-        assert reason is None
-        assert val == Decimal("-500")
+    def file_uploader(self, *args, **kwargs):
+        return None
 
-    def test_accounting_parentheses_with_decimals(self):
-        """Бухгалтерские скобки с дробной частью: (1,234.56) = -1234.56"""
-        val, reason, _ = parse_amount("(1,234.56)")
-        assert reason is None
-        assert val == Decimal("-1234.56")
+    def error(self, message, *args, **kwargs):
+        self.messages.append(("error", message))
 
-    def test_eu_format(self):
-        """Европейский формат: 1.234,56"""
-        val, reason, _ = parse_amount("1.234,56")
-        assert reason is None
-        assert val == Decimal("1234.56")
+    def warning(self, message, *args, **kwargs):
+        self.messages.append(("warning", message))
 
-    def test_us_format(self):
-        """Американский формат: 1,234.56"""
-        val, reason, _ = parse_amount("1,234.56")
-        assert reason is None
-        assert val == Decimal("1234.56")
+    def stop(self):
+        raise RuntimeError("streamlit.stop() called")
 
-    def test_space_as_thousands_separator(self):
-        """Пробел как разделитель тысяч: 1 000"""
-        val, reason, _ = parse_amount("1 000")
-        assert reason is None
-        assert val == Decimal("1000")
 
-    def test_nbsp_as_thousands_separator(self):
-        """NBSP как разделитель тысяч: 1\u00A0000,50"""
-        val, reason, _ = parse_amount("1\u00A0000,50")
-        assert reason is None
-        assert val == Decimal("1000050") or val == Decimal("1000.50")
-        # после удаления NBSP → "1000,50" → Decimal("1000.50")
-        assert val == Decimal("1000.50")
+sys.modules["streamlit"] = _StreamlitStub()
 
-    def test_trailing_minus(self):
-        """Постфиксный минус: 500-"""
-        val, reason, _ = parse_amount("500-")
-        assert reason is None
-        assert val == Decimal("-500")
+from app import (  # noqa: E402
+    build_amount_columns,
+    detect_header_row,
+    make_unique_columns,
+    norm_text,
+    parse_amount,
+    process_excel,
+)
 
-    def test_currency_symbol_rub(self):
-        """Символ валюты: 1000 ₽"""
-        val, reason, _ = parse_amount("1000 ₽")
-        assert reason is None
-        assert val == Decimal("1000")
 
-    def test_currency_symbol_usd(self):
-        """Символ валюты: $1,000.00"""
-        val, reason, _ = parse_amount("$1,000.00")
-        assert reason is None
-        assert val == Decimal("1000.00")
-
-    def test_already_numeric_int(self):
-        """Числовой int."""
-        val, reason, _ = parse_amount(42)
-        assert reason is None
-        assert val == Decimal("42")
-
-    def test_already_numeric_float(self):
-        """Числовой float → Decimal через str."""
-        val, reason, _ = parse_amount(0.1)
-        assert reason is None
-        assert isinstance(val, Decimal)
-        # Decimal(str(0.1)) = Decimal('0.1'), а не Decimal(0.1) = Decimal('0.1000...00005...')
-        assert val == Decimal("0.1")
-
-    def test_em_dash_minus(self):
-        """Длинное тире как минус."""
-        val, reason, _ = parse_amount("—500")
-        assert reason is None
-        assert val == Decimal("-500")
+def _excel_bytes(rows):
+    """Create an in-memory xlsx file from raw rows without pandas headers."""
+    buf = BytesIO()
+    pd.DataFrame(rows).to_excel(buf, index=False, header=False)
+    buf.seek(0)
+    return buf
 
 
 # ============================================================
-# 2. Пустые / невалидные значения
+# 1. Amount parsing
 # ============================================================
 
-class TestParseAmountRejects:
-    """Тесты для значений, которые НЕ должны стать суммами."""
 
-    def test_none(self):
-        val, reason, _ = parse_amount(None)
-        assert val is None
-        assert reason == "EMPTY"
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("1'000.00", Decimal("1000.00")),
+        ("1\u2019000.00", Decimal("1000.00")),
+        ("(500)", Decimal("-500")),
+        ("(1,234.56)", Decimal("-1234.56")),
+        ("1.234,56", Decimal("1234.56")),
+        ("1,234.56", Decimal("1234.56")),
+        ("1 000", Decimal("1000")),
+        ("1\u00A0000,50", Decimal("1000.50")),
+        ("1\u202F000,50", Decimal("1000.50")),
+        ("1\u2009000,50", Decimal("1000.50")),
+        ("500-", Decimal("-500")),
+        ("1000 ₽", Decimal("1000")),
+        ("$1,000.00", Decimal("1000.00")),
+        ("1000 руб.", Decimal("1000")),
+        ("—500", Decimal("-500")),
+        (42, Decimal("42")),
+        (0.1, Decimal("0.1")),
+    ],
+)
+def test_parse_amount_accepts_supported_formats(raw, expected):
+    val, reason, _ = parse_amount(raw)
 
-    def test_nan(self):
-        val, reason, _ = parse_amount(float("nan"))
-        assert val is None
-        assert reason == "EMPTY"
-
-    def test_empty_string(self):
-        val, reason, _ = parse_amount("")
-        assert val is None
-        assert reason == "EMPTY"
-
-    def test_dash(self):
-        val, reason, _ = parse_amount("-")
-        assert val is None
-        assert reason == "EMPTY"
-
-    def test_bool_marker_da(self):
-        val, reason, _ = parse_amount("Да")
-        assert val is None
-        assert reason == "NON_AMOUNT"
-
-    def test_bool_marker_net(self):
-        val, reason, _ = parse_amount("Нет")
-        assert val is None
-        assert reason == "NON_AMOUNT"
-
-    def test_pure_text(self):
-        """Чистый текст без цифр."""
-        val, reason, _ = parse_amount("текст")
-        assert val is None
-        assert reason == "NON_AMOUNT"
-
-    def test_text_with_units(self):
-        """Текст без цифр: 'шт'."""
-        val, reason, _ = parse_amount("шт")
-        assert val is None
-        assert reason == "NON_AMOUNT"
+    assert reason is None
+    assert val == expected
+    assert isinstance(val, Decimal)
 
 
-# ============================================================
-# 3. Decimal-точность при массовом суммировании
-# ============================================================
+@pytest.mark.parametrize(
+    ("raw", "expected_reason"),
+    [
+        (None, "EMPTY"),
+        (float("nan"), "EMPTY"),
+        ("", "EMPTY"),
+        ("-", "EMPTY"),
+        ("none", "EMPTY"),
+        ("nan", "EMPTY"),
+        ("Да", "NON_AMOUNT"),
+        ("Нет", "NON_AMOUNT"),
+        ("true", "NON_AMOUNT"),
+        ("false", "NON_AMOUNT"),
+        ("текст", "NON_AMOUNT"),
+        ("шт", "NON_AMOUNT"),
+        ("₽", "NON_AMOUNT"),
+        ("---", "NON_AMOUNT"),
+        ("!!!", "NON_AMOUNT"),
+    ],
+)
+def test_parse_amount_rejects_empty_and_non_amount_values(raw, expected_reason):
+    val, reason, _ = parse_amount(raw)
 
-class TestDecimalPrecision:
-    """Тесты, доказывающие что Decimal не теряет копейки."""
+    assert val is None
+    assert reason == expected_reason
 
-    def test_classic_float_trap(self):
-        """0.1 + 0.2 == 0.3 — работает в Decimal, ломается в float."""
-        a = Decimal("0.1")
-        b = Decimal("0.2")
-        assert a + b == Decimal("0.3")
-        # для контраста — float
-        assert 0.1 + 0.2 != 0.3  # float-артефакт
 
-    def test_10k_small_transactions(self):
-        """
-        10 000 транзакций по 0.0001.
-        Ожидание: 10000 * 0.0001 = 1.0000 ровно.
-        Float даст ~0.9999999999999062.
-        """
-        tx_value = Decimal("0.0001")
-        total = sum(tx_value for _ in range(10_000))
-        assert total == Decimal("1.0000")
+@pytest.mark.parametrize("raw", ["++100", "1-2", "12.34.56", "1,2,3"])
+def test_parse_amount_reports_parse_fail_for_malformed_numeric_strings(raw):
+    val, reason, debug = parse_amount(raw)
 
-    def test_10k_penny_transactions(self):
-        """
-        10 000 транзакций по 0.01.
-        Ожидание: 100.00 ровно.
-        """
-        tx_value = Decimal("0.01")
-        total = sum(tx_value for _ in range(10_000))
-        assert total == Decimal("100.00")
-
-    def test_parsed_amounts_sum(self):
-        """
-        Парсим 10 000 значений "0.01" через parse_amount и суммируем.
-        Результат должен быть Decimal("100.00").
-        """
-        values = []
-        for _ in range(10_000):
-            val, reason, _ = parse_amount("0.01")
-            assert reason is None
-            values.append(val)
-
-        total = sum(values, Decimal(0))
-        assert total == Decimal("100.00"), f"Expected 100.00, got {total}"
-
-    def test_parsed_amounts_sum_mixed_formats(self):
-        """
-        Суммирование разных форматов: результат точный.
-        """
-        inputs = [
-            "1'000.50",   # 1000.50
-            "(200,25)",   # -200.25  (скобки + EU-запятая)
-            "300.00",     # 300.00
-            "50-",        # -50.00
-        ]
-        expected = Decimal("1000.50") - Decimal("200.25") + Decimal("300.00") - Decimal("50")
-        # = 1050.25
-
-        total = Decimal(0)
-        for inp in inputs:
-            val, reason, _ = parse_amount(inp)
-            assert reason is None, f"Failed to parse: {inp}"
-            total += val
-
-        assert total == expected, f"Expected {expected}, got {total}"
+    assert val is None
+    assert reason == "PARSE_FAIL"
+    assert debug["exception"]
 
 
 # ============================================================
-# 4. Невалидные данные не попадают в итог
+# 2. Text/header helpers
 # ============================================================
 
-class TestInvalidDataIsolation:
-    """Проверяем, что невалидные строки НИКОГДА не попадают в result_rows."""
 
-    def test_text_in_amount_column_goes_to_error(self):
-        """
-        Создаём DataFrame как если бы 'текст' попал в колонку с суммами.
-        parse_amount должен вернуть NON_AMOUNT, и строка не должна стать операцией.
-        """
-        test_values = ["текст", "abc", "N/A", "---", "!!!", "Оплата чего-то"]
-        for tv in test_values:
-            val, reason, dbg = parse_amount(tv)
-            assert val is None, f"'{tv}' was parsed as {val}, expected None"
-            assert reason in {"NON_AMOUNT", "EMPTY", "PARSE_FAIL"}, \
-                f"'{tv}' reason={reason}, expected rejection"
-
-    def test_mixed_text_and_number_returns_number(self):
-        """'1000 руб.' → должен распарсить как 1000."""
-        val, reason, _ = parse_amount("1000 руб.")
-        assert reason is None
-        assert val == Decimal("1000")
-
-    def test_only_currency_symbol(self):
-        """Только '₽' без цифр → NON_AMOUNT."""
-        val, reason, _ = parse_amount("₽")
-        assert val is None
-        assert reason == "NON_AMOUNT"
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, ""),
+        ("hello\u00A0world", "hello world"),
+        ("1\u202F000", "1 000"),
+        ("1\u2009000", "1 000"),
+        ("  a   b  ", "a b"),
+    ],
+)
+def test_norm_text(raw, expected):
+    assert norm_text(raw) == expected
 
 
-# ============================================================
-# 5. Roundtrip: parse → quantize → sum → Excel
-# ============================================================
+def test_make_unique_columns_suffixes_duplicate_headers():
+    assert make_unique_columns(["Касса", "Касса", " Касса "]) == [
+        "Касса",
+        "Касса #2",
+        "Касса #3",
+    ]
 
-class TestExcelRoundtrip:
-    """Проверяем, что данные корректно добираются до Excel."""
 
-    def test_decimal_to_excel_and_back(self):
-        """
-        Записываем Decimal-суммы через openpyxl и читаем обратно.
-        Проверяем, что значения сохранены точно.
-        """
-        _two_places = Decimal("0.01")
+def test_detect_header_row_finds_date_operation_header_with_spaces_and_case():
+    df_raw = pd.DataFrame([
+        ["meta", ""],
+        ["  дата\u00A0операции  ", "Касса"],
+    ])
 
-        # Генерируем 100 сумм по 0.01 и ожидаем total = 1.00
-        values = [Decimal("0.01").quantize(_two_places, rounding=ROUND_HALF_UP) for _ in range(100)]
-        total_expected = sum(values, Decimal(0))
+    assert detect_header_row(df_raw) == 1
 
-        # Записываем в Excel
-        df = pd.DataFrame({
-            "Приход": [float(v) for v in values],  # openpyxl не пишет Decimal, конвертим в float
-        })
 
-        buf = BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Test")
-        buf.seek(0)
+def test_build_amount_columns_excludes_known_non_amount_columns():
+    df = pd.DataFrame(columns=[
+        "Дата операции",
+        "Дата начисления",
+        "Описание",
+        "Статья",
+        "Касса",
+        "Банк",
+    ])
 
-        # Читаем обратно
-        df_read = pd.read_excel(buf, sheet_name="Test")
-        total_read = Decimal(str(df_read["Приход"].sum()))
-
-        # Допуск: 0.01 (1 копейка) на 100 строк
-        assert abs(total_read - total_expected) < Decimal("0.01"), \
-            f"Excel roundtrip error: expected {total_expected}, got {total_read}"
-
-    def test_zero_hidden_format_preserves_numeric_type(self):
-        """
-        Записываем 0 с кастомным форматом — ячейка остаётся числовой.
-        """
-        buf = BytesIO()
-        from openpyxl import Workbook
-        wb = Workbook()
-        ws = wb.active
-        ws["A1"] = "Приход"
-        ws["A2"] = 0
-        ws["A2"].number_format = '#,##0.00;-#,##0.00;""'
-        ws["A3"] = 100.50
-        ws["A3"].number_format = '#,##0.00;-#,##0.00;""'
-        wb.save(buf)
-        buf.seek(0)
-
-        # Читаем обратно
-        wb2 = load_workbook(buf)
-        ws2 = wb2.active
-        assert ws2["A2"].value == 0  # Числовой 0, не строка
-        assert isinstance(ws2["A2"].value, (int, float))
-        assert ws2["A3"].value == 100.50
-        assert isinstance(ws2["A3"].value, float)
+    assert build_amount_columns(df) == ["Касса", "Банк"]
 
 
 # ============================================================
-# 6. Norm_text — обработка экзотических пробелов
+# 3. Decimal precision and rounding
 # ============================================================
 
-class TestNormText:
-    """Проверяем нормализацию текста."""
 
-    def test_nbsp(self):
-        assert norm_text("hello\u00A0world") == "hello world"
+def test_decimal_math_does_not_lose_cents():
+    values = [Decimal("0.01") for _ in range(10_000)]
 
-    def test_narrow_nbsp(self):
-        assert norm_text("1\u202F000") == "1 000"
+    assert sum(values, Decimal(0)) == Decimal("100.00")
+    assert Decimal("0.1") + Decimal("0.2") == Decimal("0.3")
+    assert 0.1 + 0.2 != 0.3
 
-    def test_thin_space(self):
-        assert norm_text("1\u2009000") == "1 000"
 
-    def test_multiple_spaces(self):
-        assert norm_text("  a   b  ") == "a b"
+def test_parsed_amounts_sum_exactly():
+    values = [parse_amount("0.01")[0] for _ in range(10_000)]
 
-    def test_none(self):
-        assert norm_text(None) == ""
+    assert sum(values, Decimal(0)) == Decimal("100.00")
+
+
+@pytest.mark.parametrize(
+    ("value", "income", "expense"),
+    [
+        (Decimal("10.005"), Decimal("10.01"), Decimal("0")),
+        (Decimal("-10.005"), Decimal("0"), Decimal("10.01")),
+        (Decimal("0.004"), Decimal("0.00"), Decimal("0")),
+        (Decimal("-0.004"), Decimal("0"), Decimal("0.00")),
+    ],
+)
+def test_round_half_up_rules_used_by_converter(value, income, expense):
+    two_places = Decimal("0.01")
+    zero = Decimal(0)
+
+    actual_income = value.quantize(two_places, rounding=ROUND_HALF_UP) if value > zero else zero
+    actual_expense = (-value).quantize(two_places, rounding=ROUND_HALF_UP) if value < zero else zero
+
+    assert actual_income == income
+    assert actual_expense == expense
+
+
+# ============================================================
+# 4. Full Excel processing
+# ============================================================
+
+
+def test_process_excel_converts_wide_amount_columns_to_operations_and_sorts_by_dates():
+    uploaded_file = _excel_bytes([
+        ["service row", "", "", "", "", "", ""],
+        ["№ п.п.", "Дата операции", "Дата начисления", "Описание", "Статья", "Касса", "Банк"],
+        [1, "2026-04-20", "2026-04-20", "april", "Маркетинг", "", "300"],
+        [2, "2025-12-19", "2025-12-01", "dec early pnl", "Логистика", "100", ""],
+        [3, "2025-09-04", "2025-08-31", "sep", "Логистика", "-50", ""],
+        [4, "2025-12-19", "2025-12-20", "dec late pnl", "Маркетинг", "200", ""],
+    ])
+
+    display_df, export_df, error_df = process_excel(uploaded_file)
+
+    assert error_df.empty
+    assert list(export_df.columns) == [
+        "Дата ДДС",
+        "Дата P&L",
+        "Приход",
+        "Расход",
+        "Статья операции",
+        "Касса / Счет",
+        "Комментарий",
+    ]
+    assert display_df["Дата ДДС"].tolist() == [
+        "04.09.2025",
+        "19.12.2025",
+        "19.12.2025",
+        "20.04.2026",
+    ]
+    assert display_df["Дата P&L"].tolist() == [
+        "31.08.2025",
+        "01.12.2025",
+        "20.12.2025",
+        "20.04.2026",
+    ]
+    assert display_df["Комментарий"].tolist() == [
+        "sep",
+        "dec early pnl",
+        "dec late pnl",
+        "april",
+    ]
+    assert export_df["Приход"].tolist() == [
+        Decimal("0"),
+        Decimal("100.00"),
+        Decimal("200.00"),
+        Decimal("300.00"),
+    ]
+    assert export_df["Расход"].tolist() == [
+        Decimal("50.00"),
+        Decimal("0"),
+        Decimal("0"),
+        Decimal("0"),
+    ]
+    assert export_df["Касса / Счет"].tolist() == ["Касса", "Касса", "Касса", "Банк"]
+
+
+def test_process_excel_creates_one_operation_per_non_empty_amount_cell():
+    uploaded_file = _excel_bytes([
+        ["Дата операции", "Дата начисления", "Описание", "Статья", "Касса", "Банк"],
+        ["2026-01-10", "2026-01-09", "split", "Доход", "100", "-25"],
+    ])
+
+    display_df, export_df, error_df = process_excel(uploaded_file)
+
+    assert error_df.empty
+    assert len(export_df) == 2
+    operations_by_account = {
+        row["Касса / Счет"]: (row["Приход"], row["Расход"])
+        for row in export_df.to_dict("records")
+    }
+    assert operations_by_account == {
+        "Касса": (Decimal("100.00"), Decimal("0")),
+        "Банк": (Decimal("0"), Decimal("25.00")),
+    }
+
+
+def test_process_excel_logs_rounded_to_zero_and_excludes_operation():
+    uploaded_file = _excel_bytes([
+        ["Дата операции", "Дата начисления", "Описание", "Статья", "Касса"],
+        ["2026-01-10", "2026-01-10", "tiny", "Доход", "0.004"],
+    ])
+
+    display_df, export_df, error_df = process_excel(uploaded_file)
+
+    assert display_df.empty
+    assert export_df.empty
+    assert len(error_df) == 1
+    assert error_df.loc[0, "Причина_пропуска"] == "ROUNDED_TO_ZERO"
+    assert error_df.loc[0, "Сумма_числом"] == Decimal("0.004")
+
+
+def test_process_excel_skips_text_amounts_without_logging_operations():
+    uploaded_file = _excel_bytes([
+        ["Дата операции", "Дата начисления", "Описание", "Статья", "Касса"],
+        ["2026-01-10", "2026-01-10", "text", "Доход", "не сумма"],
+    ])
+
+    result = process_excel(uploaded_file)
+
+    assert result is None
+
+
+def test_process_excel_returns_none_when_header_is_missing():
+    uploaded_file = _excel_bytes([
+        ["Дата платежа", "Касса"],
+        ["2026-01-10", "100"],
+    ])
+
+    assert process_excel(uploaded_file) is None
+
+
+# ============================================================
+# 5. Excel roundtrip
+# ============================================================
+
+
+def test_decimal_values_can_be_written_to_excel_as_numbers_and_read_back():
+    values = [Decimal("0.01").quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) for _ in range(100)]
+    expected_total = sum(values, Decimal(0))
+    df = pd.DataFrame({"Приход": [float(v) for v in values]})
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Test")
+    buf.seek(0)
+
+    df_read = pd.read_excel(buf, sheet_name="Test")
+    actual_total = Decimal(str(df_read["Приход"].sum()))
+
+    assert abs(actual_total - expected_total) < Decimal("0.01")
+
+
+def test_zero_hidden_format_preserves_numeric_cell_type():
+    buf = BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws["A1"] = "Приход"
+    ws["A2"] = 0
+    ws["A2"].number_format = '#,##0.00;-#,##0.00;""'
+    ws["A3"] = 100.50
+    ws["A3"].number_format = '#,##0.00;-#,##0.00;""'
+    wb.save(buf)
+    buf.seek(0)
+
+    wb2 = load_workbook(buf)
+    ws2 = wb2.active
+
+    assert ws2["A2"].value == 0
+    assert isinstance(ws2["A2"].value, (int, float))
+    assert ws2["A3"].value == 100.50
+    assert isinstance(ws2["A3"].value, float)
