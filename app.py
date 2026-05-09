@@ -48,7 +48,7 @@ def parse_amount(val):
         debug["rule"] = "EMPTY:None/NaN"
         return None, "EMPTY", debug
 
-    # already numeric — через str, чтобы избежать float-артефактов
+    # already numeric - через str, чтобы избежать float-артефактов
     if isinstance(val, (int, float)) and not pd.isna(val):
         try:
             d = Decimal(str(val))
@@ -123,7 +123,7 @@ def parse_amount(val):
 
     debug["normalized"] = s
 
-    # final cast — Decimal
+    # final cast - Decimal
     try:
         num = Decimal(s)
         if is_paren_negative:
@@ -150,7 +150,7 @@ def make_unique_columns(cols):
             out.append(f"{c} #{seen[c]}")
 
     return out
-    
+
 def detect_header_row(df_raw: pd.DataFrame) -> int | None:
     """
     Find row index that contains 'Дата операции' (case-insensitive, tolerant to spaces).
@@ -162,7 +162,7 @@ def detect_header_row(df_raw: pd.DataFrame) -> int | None:
             return i
     return None
 
-def build_amount_columns(df: pd.DataFrame, headers=None):
+def build_amount_columns(df: pd.DataFrame, column_keys: dict[str, str] | None = None):
     exclude_cols = {
         "дата операции",
         "описание",
@@ -171,7 +171,25 @@ def build_amount_columns(df: pd.DataFrame, headers=None):
         "",
         "nan",
     }
-    return [c for c in df.columns if norm_key(c) not in exclude_cols]
+    if column_keys is None:
+        column_keys = {c: norm_key(c) for c in df.columns}
+    return [c for c in df.columns if column_keys[c] not in exclude_cols]
+
+def make_error_df(error_rows):
+    columns = [
+        "Источник_строка",
+        "Источник_колонка",
+        "Сумма_как_в_файле",
+        "Сумма_нормализованная",
+        "Сумма_числом",
+        "Причина_пропуска",
+        "Лог",
+        "Дата ДДС (как в файле)",
+        "Дата P&L (как в файле)",
+        "Статья",
+        "Комментарий",
+    ]
+    return pd.DataFrame(error_rows) if error_rows else pd.DataFrame(columns=columns)
 
 # =========================
 # Core processing
@@ -193,6 +211,8 @@ def process_excel(uploaded_file):
     df = df_raw.iloc[header_idx + 1:].copy()
     df.columns = headers
 
+    column_keys = {c: norm_key(c) for c in df.columns}
+
     # Drop known irrelevant cols (tolerant: compare by normalized key)
     cols_to_drop_keys = {
         "№  п.п.",
@@ -204,15 +224,14 @@ def process_excel(uploaded_file):
         "компания",
         "id",
     }
-    drop_cols = []
-    for c in df.columns:
-        if norm_key(c) in {norm_key(x) for x in cols_to_drop_keys}:
-            drop_cols.append(c)
+    cols_to_drop_keys_norm = {norm_key(x) for x in cols_to_drop_keys}
+    drop_cols = [c for c, key in column_keys.items() if key in cols_to_drop_keys_norm]
     if drop_cols:
         df = df.drop(columns=drop_cols, errors="ignore")
+        column_keys = {c: key for c, key in column_keys.items() if c not in drop_cols}
 
     # Map actual column names for key fields (tolerant)
-    col_map = {norm_key(c): c for c in df.columns}
+    col_map = {key: c for c, key in column_keys.items()}
     col_date_op = col_map.get("дата операции")
     col_date_pl = col_map.get("дата начисления")
     col_desc = col_map.get("описание")
@@ -222,85 +241,96 @@ def process_excel(uploaded_file):
         st.error("В таблице после заголовка нет колонки 'Дата операции' (проверь формат файла).")
         return None
 
-    amount_cols = build_amount_columns(df)
+    amount_cols = build_amount_columns(df, column_keys)
 
     result_rows = []
     error_rows = []
 
-    # Iterate source rows
-    for src_idx, row in df.iterrows():
-        date_dds = get_scalar(row.get(col_date_op, pd.NaT))
-        date_pl = get_scalar(row.get(col_date_pl, pd.NaT)) if col_date_pl else pd.NaT
-        description = norm_text(get_scalar(row.get(col_desc, ""))) if col_desc else ""
-        article = norm_text(get_scalar(row.get(col_article, ""))) if col_article else ""
+    columns = list(df.columns)
+    col_pos = {c: i for i, c in enumerate(columns)}
+    pos_date_op = col_pos[col_date_op]
+    pos_date_pl = col_pos.get(col_date_pl) if col_date_pl else None
+    pos_desc = col_pos.get(col_desc) if col_desc else None
+    pos_article = col_pos.get(col_article) if col_article else None
+    key_field_cols = {col_date_op, col_date_pl, col_desc, col_article}
+    amount_col_info = [
+        (col_pos[col], col, norm_text(col))
+        for col in amount_cols
+        if col not in key_field_cols
+    ]
+
+    _zero = Decimal(0)
+    _two_places = Decimal("0.01")
+
+    # Iterate source rows. Using numpy rows avoids pandas Series creation for each row.
+    for src_idx, row_values in zip(df.index, df.to_numpy(dtype=object, copy=False)):
+        date_dds = get_scalar(row_values[pos_date_op])
+        date_pl = get_scalar(row_values[pos_date_pl]) if pos_date_pl is not None else pd.NaT
+        description = norm_text(get_scalar(row_values[pos_desc])) if pos_desc is not None else ""
+        article = norm_text(get_scalar(row_values[pos_article])) if pos_article is not None else ""
 
         # Iterate amount columns
-        for col in amount_cols:
-            if col in {col_date_op, col_date_pl, col_desc, col_article}:
-                continue
-
-            raw_val = get_scalar(row.get(col))
+        for pos, col, col_label in amount_col_info:
+            raw_val = get_scalar(row_values[pos])
 
             value, reason, dbg = parse_amount(raw_val)
 
             if reason in {"EMPTY", "NON_AMOUNT"}:
                 continue
 
-            # если парсинг не удался — пишем точную причину и лог
+            # если парсинг не удался - пишем точную причину и лог
             if reason is not None:
                 error_rows.append({
                     "Источник_строка": int(src_idx) + 1,
-                    "Источник_колонка": norm_text(col),
-            
+                    "Источник_колонка": col_label,
+
                     "Сумма_как_в_файле": dbg.get("raw_str"),
                     "Сумма_нормализованная": dbg.get("normalized"),
                     "Сумма_числом": "",
-            
+
                     "Причина_пропуска": reason,
                     "Лог": f"{dbg.get('rule')} | exception={dbg.get('exception')}",
-            
+
                     "Дата ДДС (как в файле)": date_dds,
                     "Дата P&L (как в файле)": date_pl,
                     "Статья": article,
                     "Комментарий": description,
                 })
                 continue
-            
-            _zero = Decimal(0)
-            _two_places = Decimal("0.01")
+
             income = value.quantize(_two_places, rounding=ROUND_HALF_UP) if value > _zero else _zero
             expense = (-value).quantize(_two_places, rounding=ROUND_HALF_UP) if value < _zero else _zero
-            
-            # если число есть, но после округления стало 0 — логируем и НЕ добавляем в операции
+
+            # если число есть, но после округления стало 0 - логируем и НЕ добавляем в операции
             if income == _zero and expense == _zero and abs(value) > _zero:
                 error_rows.append({
                     "Источник_строка": int(src_idx) + 1,
-                    "Источник_колонка": norm_text(col),
-            
+                    "Источник_колонка": col_label,
+
                     "Сумма_как_в_файле": dbg.get("raw_str"),
                     "Сумма_нормализованная": dbg.get("normalized"),
                     "Сумма_числом": value,
-            
+
                     "Причина_пропуска": "ROUNDED_TO_ZERO",
                     "Лог": f"value={value} -> income={income}, expense={expense} (round to 2 decimals)",
-            
+
                     "Дата ДДС (как в файле)": date_dds,
                     "Дата P&L (как в файле)": date_pl,
                     "Статья": article,
                     "Комментарий": description,
                 })
                 continue
-            
+
             result_rows.append({
                 "Источник_строка": int(src_idx) + 1,
-                "Источник_колонка": norm_text(col),
-            
+                "Источник_колонка": col_label,
+
                 "Дата ДДС": date_dds,
                 "Дата P&L": date_pl,
                 "Приход": income,
                 "Расход": expense,
                 "Статья операции": article,
-                "Касса / Счет": norm_text(col),
+                "Касса / Счет": col_label,
                 "Комментарий": description
             })
 
@@ -311,19 +341,13 @@ def process_excel(uploaded_file):
     result_df = pd.DataFrame(result_rows) if result_rows else pd.DataFrame(
         columns=["Источник_строка","Источник_колонка","Дата ДДС","Дата P&L","Приход","Расход","Статья операции","Касса / Счет","Комментарий"]
     )
-    error_df = pd.DataFrame(error_rows) if error_rows else pd.DataFrame(
-        columns=["Источник_строка","Источник_колонка","Сумма_как_в_файле","Сумма_нормализованная","Сумма_числом","Причина_пропуска","Лог","Дата ДДС (как в файле)","Дата P&L (как в файле)","Статья","Комментарий"]
-    )
-    
+
     # Normalize dates for sorting/export
     if not result_df.empty:
         result_df["Дата ДДС"] = pd.to_datetime(result_df["Дата ДДС"], errors="coerce")
         result_df["Дата P&L"] = pd.to_datetime(result_df["Дата P&L"], errors="coerce")
 
-        _zero_d = Decimal(0)
-        _two_places = Decimal("0.01")
-
-        # Строгая проверка: если в колонку попало не-Decimal — логируем и удаляем
+        # Строгая проверка: если в колонку попало не-Decimal - логируем и удаляем
         for col_name in ["Приход", "Расход"]:
             invalid_mask = result_df[col_name].apply(
                 lambda v: not isinstance(v, (Decimal, int)) or (isinstance(v, float) and pd.isna(v))
@@ -347,13 +371,15 @@ def process_excel(uploaded_file):
                 result_df = result_df[~invalid_mask].copy()
 
         # убираем строки без суммы
-        result_df = result_df[~((result_df["Приход"] == _zero_d) & (result_df["Расход"] == _zero_d))].copy()
+        result_df = result_df[~((result_df["Приход"] == _zero) & (result_df["Расход"] == _zero))].copy()
 
         # нормализуем комментарий
         result_df["Комментарий"] = result_df["Комментарий"].fillna("").astype(str).str.strip()
 
         # сортировка
         result_df = result_df.sort_values(by=["Дата ДДС", "Дата P&L"]).reset_index(drop=True)
+
+    error_df = make_error_df(error_rows)
 
     # --- фиксируем порядок колонок ---
     desired_order = [
@@ -365,7 +391,7 @@ def process_excel(uploaded_file):
         "Касса / Счет",
         "Комментарий",
     ]
-    
+
     existing = [c for c in desired_order if c in result_df.columns]
     result_df = result_df[existing]
 
@@ -376,7 +402,7 @@ def process_excel(uploaded_file):
         display_df["Дата P&L"] = display_df["Дата P&L"].dt.strftime("%d.%m.%Y").fillna("")
         display_df["Приход"] = display_df["Приход"].apply(lambda x: "" if x == Decimal(0) else float(x))
         display_df["Расход"] = display_df["Расход"].apply(lambda x: "" if x == Decimal(0) else float(x))
-    
+
     return display_df, result_df, error_df
 
 # =========================
@@ -415,7 +441,7 @@ if uploaded_file:
         # ========== Export to Excel ==========
         output_buffer = BytesIO()
 
-        # Prepare export: даты как строки, суммы Decimal→float для openpyxl
+        # Prepare export: даты как строки, суммы Decimal->float для openpyxl
         export_for_excel = export_df.copy()
         if not export_for_excel.empty:
             export_for_excel["Дата ДДС"] = pd.to_datetime(export_for_excel["Дата ДДС"], errors="coerce").dt.strftime("%d.%m.%Y").fillna("")
