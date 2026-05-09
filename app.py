@@ -377,7 +377,11 @@ def process_excel(uploaded_file):
         result_df["Комментарий"] = result_df["Комментарий"].fillna("").astype(str).str.strip()
 
         # сортировка
-        result_df = result_df.sort_values(by=["Дата ДДС", "Дата P&L"]).reset_index(drop=True)
+        result_df = result_df.sort_values(
+            by=["Дата ДДС", "Дата P&L"],
+            ascending=[True, True],
+            na_position="last",
+        ).reset_index(drop=True)
 
     error_df = make_error_df(error_rows)
 
@@ -429,7 +433,7 @@ if uploaded_file:
             if export_df.empty:
                 st.info("Операции не сформированы. Проверь вкладку 'Ошибки/пропуски'.")
             else:
-                st.dataframe(display_df, use_container_width=True)
+                st.dataframe(display_df.reset_index(drop=True), use_container_width=True, hide_index=True)
 
         with tab2:
             if error_df.empty:
