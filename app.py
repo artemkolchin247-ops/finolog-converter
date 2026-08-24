@@ -479,7 +479,7 @@ if uploaded_file:
             header_row = [cell.value for cell in ws_ops[1]]
             income_col_idx = (header_row.index("Приход") + 1) if "Приход" in header_row else None
             expense_col_idx = (header_row.index("Расход") + 1) if "Расход" in header_row else None
-            zero_hidden_fmt = '#,##0.00;-#,##0.00;""'
+            zero_hidden_fmt = '0.00;-0.00;""'
             for row_idx in range(2, ws_ops.max_row + 1):
                 if income_col_idx:
                     cell = ws_ops.cell(row=row_idx, column=income_col_idx)
